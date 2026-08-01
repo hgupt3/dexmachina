@@ -39,326 +39,469 @@ def get_contact_marker_cfgs(
     return contact_marker_cfgs
 
 
-"""
-Note that might need to specify options.max_collision_pairs to get more contacts.
-see gs.options.solvers.RigidOptions(max_collision_pairs=100) default is 100
-"""
-@torch.jit.script
-def get_expanded_mask(n_contacts, pair_a, pair_b, a_idxs, b_idxs):
-    """ 
-    Input:
-    - n_contacts: (N,) number of contacts, must use this to consider only top k contacts
-    - pair_a: (n_max_contacts, N) tensor of geom indices for entity A
-    - pair_b: (n_max_contacts, N) tensor of geom indices for entity B
-    - a_idxs: (n_a,) tensor of geom indices to filter for entity A
-    - b_idxs: (n_b,) tensor of geom indices to filter for entity B
-    Output:
-    - mask: (n_max_contacts, N, n_a, n_b) tensor of expanded mask. Use this to filter contacts
-    
-    Note that we need to flip the mask for both pairs 
-    """
-    # set out-of-bound indices to -3
-    pair_a[n_contacts.unsqueeze(0) <= torch.arange(pair_a.shape[0], device=pair_a.device).view(-1, 1)] = -3 
-    pair_b[n_contacts.unsqueeze(0) <= torch.arange(pair_b.shape[0], device=pair_b.device).view(-1, 1)] = -3
-    assert a_idxs.ndim == 1 and b_idxs.ndim == 1, "a_idxs and b_idxs should be 1D tensors"
-    mask_a = pair_a.unsqueeze(-1) == a_idxs.view(1, 1, -1)
-    mask_b = pair_b.unsqueeze(-1) == b_idxs.view(1, 1, -1)
-    mask = torch.logical_and(mask_a.unsqueeze(-1), mask_b.unsqueeze(-2))
-    mask_a_flip = pair_a.unsqueeze(-1) == b_idxs.view(1, 1, -1)
-    mask_b_flip = pair_b.unsqueeze(-1) == a_idxs.view(1, 1, -1)
-    mask_flip = torch.logical_and(mask_a_flip.unsqueeze(-1), mask_b_flip.unsqueeze(-2))
+class ContactIndexFilter:
+    """Reusable index-based filtering for one fixed pair of index sets.
 
-    mask = torch.logical_or(mask, mask_flip.transpose(-1, -2)) 
-     
-    return mask 
+    Genesis reports contacts as two global integer IDs.  The old implementation
+    compared those IDs with every requested A/B combination and materialized a
+    ``(max_pairs, num_envs, n_a, n_b)`` boolean tensor twice.  This object keeps
+    dense global-ID-to-local-ID lookups and reuses O(max_pairs * num_envs)
+    matching/scatter workspaces instead.
 
-@torch.jit.script
-def get_filtered_contact_force_from_mask(force, mask):
+    Filter indices are entity link/geometry sets and are therefore expected to
+    be unique non-negative global IDs.
     """
-    Input: 
-    - force: (n_contacts, N, 3) tensor of contact forces
-    - mask: (n_contacts, N, n_a, n_b) tensor of expanded mask, n_a is either num of geoms or num of links 
-    Return:
-    - summed force tensor of shape (N, n_a, n_b, 3) """
-    mask_expand = mask.unsqueeze(-1)
-    force_expand = force.unsqueeze(-2).unsqueeze(-2)
-    sum_force = (force_expand * mask_expand).sum(dim=0)
-    return sum_force
 
+    def __init__(self, a_idxs, b_idxs):
+        if not isinstance(a_idxs, torch.Tensor):
+            a_idxs = torch.as_tensor(a_idxs, dtype=torch.long)
+        if not isinstance(b_idxs, torch.Tensor):
+            b_idxs = torch.as_tensor(b_idxs, dtype=torch.long, device=a_idxs.device)
+        if a_idxs.ndim != 1 or b_idxs.ndim != 1:
+            raise ValueError("a_idxs and b_idxs should be 1D tensors")
+        if a_idxs.device != b_idxs.device:
+            b_idxs = b_idxs.to(a_idxs.device)
 
-# @torch.jit.script
-def get_all_contact_pos_from_mask(contact_pos, mask):
-    """
-    Get the contact positions from the mask, this gets all the positions for each geom/link in entity A
-    Input: 
-    - contact_pos: (n_contacts, N, 3) tensor of contact positions
-    - contact_force_norm: (n_contacts, N) tensor of contact force norms
-    - mask: (n_contacts, N, n_a, n_b) tensor of expanded mask
-    Return:
-    - all_contact_pos: (N, n_a, n_contacts, 3) tensor of contact positions
-    - all_contact_pos_valid: (N, n_a, n_contacts) tensor of valid contact positions
-    """
-    device = contact_pos.device  
-    n_a = mask.shape[-2]
-    n_b = mask.shape[-1]
-    n_con = contact_pos.shape[0]
-    n_envs = contact_pos.shape[1]
-    
-    all_contact_pos = torch.zeros(n_con, n_envs, n_a, 3).to(device) # allocate max n_con contacts for each geom/link in entity A
-    all_contact_pos_valid = torch.zeros((n_con, n_envs, n_a), dtype=torch.bool).to(device) # mask for valid contact positions
+        self.a_idxs = a_idxs.to(dtype=torch.long)
+        self.b_idxs = b_idxs.to(dtype=torch.long)
+        self.n_a = self.a_idxs.numel()
+        self.n_b = self.b_idxs.numel()
+        self.device = self.a_idxs.device
 
-    for idx in range(n_a):
-        coll_b_msk = mask[:, :, idx, :] # shape (n_contacts, N, n_b)
-        any_b_msk = coll_b_msk.any(dim=-1) # shape (n_contacts, N)
-        all_contact_pos[:, :, idx] = contact_pos * any_b_msk.unsqueeze(-1)
-        all_contact_pos_valid[:, :, idx] = any_b_msk 
-    # breakpoint()
-    # reshape 
-    all_contact_pos = all_contact_pos.permute(1, 2, 0, 3) # shape (N, n_a, n_contacts, 3)
-    all_contact_pos_valid = all_contact_pos_valid.permute(1, 2, 0) # shape (N, n_a, n_contacts)
-    return all_contact_pos, all_contact_pos_valid
+        if self.n_a and torch.unique(self.a_idxs).numel() != self.n_a:
+            raise ValueError("a_idxs should contain unique global indices")
+        if self.n_b and torch.unique(self.b_idxs).numel() != self.n_b:
+            raise ValueError("b_idxs should contain unique global indices")
+        if (self.n_a and self.a_idxs.min().item() < 0) or (
+            self.n_b and self.b_idxs.min().item() < 0
+        ):
+            raise ValueError("contact filter indices should be non-negative")
 
-@torch.jit.script
-def get_grouped_contact_pos(contact_pos, contact_force_norm, mask):
-    """
-    Get the contact positions from the mask, this groups the contact positions by geom/link in entity A and all the valid contacts with entity B
-    Input: 
-    - contact_pos: (n_contacts, N, 3) tensor of contact positions
-    - contact_force_norm: (n_contacts, N) tensor of contact force norms
-    - mask: (n_contacts, N, n_a, n_b) tensor of expanded mask
-    Return:
-    - grouped_contact_pos: (N, n_a, n_b, 3) tensor of contact positions
-    - grouped_contact_pos_valid: (N, n_a, n_b) tensor of valid contact positions
-    """
-    device = contact_pos.device  
-    contact_force_norm = contact_force_norm.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # (n_contacts, N, 1, 1, 1)    
-    pos_expanded = contact_pos.unsqueeze(-2).unsqueeze(-2) # (n_contacts, N, 1, 1, 3)
-    pos_masked = pos_expanded * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_a, n_b, 3)
-    weightd_pos = pos_expanded * contact_force_norm  # (n_contacts, N, 1, 1, 3)
-    weighted_pos_masked = weightd_pos * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_a, n_b, 3)
-    # Sum weighted positions and contact forces across all contacts (dim=0)
-    weighted_sum = torch.sum(weighted_pos_masked, dim=0)  # (N, n_a, n_b, 3)
-    force_sum = torch.sum(contact_force_norm * mask.unsqueeze(-1), dim=0)  # (N, n_a, n_b, 1)
-    # Compute the weighted average (avoid division by zero)
-    grouped_contact_pos = torch.where(
-        force_sum > 0,
-        weighted_sum / force_sum,
-        torch.zeros_like(weighted_sum)
-    )
-    # Compute validity (at least one valid contact)
-    grouped_contact_pos_valid = (force_sum > 0).squeeze(-1) # (N, n_a, n_b)
-    return grouped_contact_pos, grouped_contact_pos_valid
+        max_id = -1
+        if self.n_a:
+            max_id = max(max_id, self.a_idxs.max().item())
+        if self.n_b:
+            max_id = max(max_id, self.b_idxs.max().item())
+
+        # IDs are stored at ID + 1.  Slot zero catches negative IDs and the
+        # final slot catches IDs above max_id after clamping.
+        lookup_size = max_id + 3
+        self._sentinel = lookup_size - 1
+        self._a_lookup = torch.full(
+            (lookup_size,), -1, dtype=torch.long, device=self.device
+        )
+        self._b_lookup = torch.full_like(self._a_lookup, -1)
+        if self.n_a:
+            self._a_lookup[self.a_idxs + 1] = torch.arange(
+                self.n_a, device=self.device
+            )
+        if self.n_b:
+            self._b_lookup[self.b_idxs + 1] = torch.arange(
+                self.n_b, device=self.device
+            )
+
+        self._pair_shape = None
+        self._float_dtype = None
+        self._prepared = False
+
+    def _ensure_pair_workspace(self, pair_a, pair_b):
+        if pair_a.shape != pair_b.shape or pair_a.ndim != 2:
+            raise ValueError("pair_a and pair_b should have matching 2D shapes")
+        if pair_a.device != self.device or pair_b.device != self.device:
+            raise ValueError("contact pairs and filter lookups should share a device")
+        if self._pair_shape == tuple(pair_a.shape):
+            return
+
+        n_pairs, n_envs = pair_a.shape
+        shape = (n_pairs, n_envs)
+        long_kwargs = dict(dtype=torch.long, device=self.device)
+        bool_kwargs = dict(dtype=torch.bool, device=self.device)
+        self._safe_a = torch.empty(shape, **long_kwargs)
+        self._safe_b = torch.empty(shape, **long_kwargs)
+        self._a_from_a = torch.empty(shape, **long_kwargs)
+        self._b_from_b = torch.empty(shape, **long_kwargs)
+        self._b_from_a = torch.empty(shape, **long_kwargs)
+        self._a_from_b = torch.empty(shape, **long_kwargs)
+        self._direct = torch.empty(shape, **bool_kwargs)
+        self._flipped = torch.empty(shape, **bool_kwargs)
+        self._temporary_mask = torch.empty(shape, **bool_kwargs)
+        self._valid_contacts = torch.empty(shape, **bool_kwargs)
+        self._direct_target = torch.empty(shape, **long_kwargs)
+        self._flipped_target = torch.empty(shape, **long_kwargs)
+        self._combined_target = torch.empty((*shape, 2), **long_kwargs)
+        self._combined_mask = torch.empty((*shape, 2), **bool_kwargs)
+        self._pair_ordinals = torch.arange(
+            n_pairs, dtype=torch.long, device=self.device
+        ).view(-1, 1)
+        self._env_bin_offsets = (
+            torch.arange(n_envs, dtype=torch.long, device=self.device).view(1, -1)
+            * (self.n_a * self.n_b)
+        )
+        self._env_pos_offsets = (
+            torch.arange(n_envs, dtype=torch.long, device=self.device).view(1, -1)
+            * (self.n_a * n_pairs)
+        )
+        self._pair_shape = shape
+        self._float_dtype = None
+        self._position_shape = None
+
+    def _ensure_float_workspace(self, dtype):
+        if self._float_dtype == dtype:
+            return
+        self._combined_vector_source = torch.empty(
+            (*self._pair_shape, 2, 3), dtype=dtype, device=self.device
+        )
+        self._weighted_position = torch.empty(
+            (*self._pair_shape, 3), dtype=dtype, device=self.device
+        )
+        self._combined_scalar_source = torch.empty(
+            (*self._pair_shape, 2), dtype=dtype, device=self.device
+        )
+        self._contact_norm = torch.empty(
+            self._pair_shape, dtype=dtype, device=self.device
+        )
+        n_envs = self._pair_shape[1]
+        self._force_sums = torch.empty(
+            (n_envs, self.n_a, self.n_b), dtype=dtype, device=self.device
+        )
+        self._invalid_sums = torch.empty(
+            (n_envs, self.n_a, self.n_b), dtype=torch.bool, device=self.device
+        )
+        self._float_dtype = dtype
+
+    def contact_force_norm(self, force):
+        """Compute force norms into a reusable pair-sized buffer."""
+        self._ensure_float_workspace(force.dtype)
+        torch.linalg.vector_norm(force, dim=-1, out=self._contact_norm)
+        return self._contact_norm
+
+    def prepare(self, n_contacts, pair_a, pair_b):
+        """Gather local indices and validity for direct and flipped pairs."""
+        self._ensure_pair_workspace(pair_a, pair_b)
+        if n_contacts.shape != (pair_a.shape[1],):
+            raise ValueError("n_contacts should have shape (num_envs,)")
+
+        self._safe_a.copy_(pair_a)
+        self._safe_a.add_(1).clamp_(0, self._sentinel)
+        self._safe_b.copy_(pair_b)
+        self._safe_b.add_(1).clamp_(0, self._sentinel)
+        torch.take(self._a_lookup, self._safe_a, out=self._a_from_a)
+        torch.take(self._b_lookup, self._safe_b, out=self._b_from_b)
+        torch.take(self._b_lookup, self._safe_a, out=self._b_from_a)
+        torch.take(self._a_lookup, self._safe_b, out=self._a_from_b)
+
+        torch.lt(
+            self._pair_ordinals,
+            n_contacts.view(1, -1),
+            out=self._valid_contacts,
+        )
+        torch.ge(self._a_from_a, 0, out=self._direct)
+        torch.ge(self._b_from_b, 0, out=self._temporary_mask)
+        self._direct.logical_and_(self._temporary_mask)
+        self._direct.logical_and_(self._valid_contacts)
+
+        torch.ge(self._b_from_a, 0, out=self._flipped)
+        torch.ge(self._a_from_b, 0, out=self._temporary_mask)
+        self._flipped.logical_and_(self._temporary_mask)
+        self._flipped.logical_and_(self._valid_contacts)
+
+        if self.n_a and self.n_b:
+            self._direct_target.copy_(self._a_from_a)
+            self._direct_target.mul_(self.n_b).add_(self._b_from_b)
+            self._direct_target.add_(self._env_bin_offsets)
+            self._direct_target.mul_(self._direct)
+
+            self._flipped_target.copy_(self._a_from_b)
+            self._flipped_target.mul_(self.n_b).add_(self._b_from_a)
+            self._flipped_target.add_(self._env_bin_offsets)
+
+            # If overlapping filter sets make both orientations select the
+            # same output cell, logical OR in the old mask counted it once.
+            torch.eq(
+                self._direct_target,
+                self._flipped_target,
+                out=self._temporary_mask,
+            )
+            self._temporary_mask.logical_and_(self._direct)
+            self._temporary_mask.logical_and_(self._flipped)
+            torch.logical_not(self._temporary_mask, out=self._valid_contacts)
+            self._flipped.logical_and_(self._valid_contacts)
+            self._flipped_target.mul_(self._flipped)
+            self._combined_target[..., 0].copy_(self._direct_target)
+            self._combined_target[..., 1].copy_(self._flipped_target)
+            self._combined_mask[..., 0].copy_(self._direct)
+            self._combined_mask[..., 1].copy_(self._flipped)
+
+        self._prepared = True
+
+    def _check_output(self, output, shape, dtype):
+        if output is None:
+            return torch.empty(shape, dtype=dtype, device=self.device)
+        if output.shape != shape or output.device != self.device or output.dtype != dtype:
+            raise ValueError(
+                f"output should have shape {shape}, dtype {dtype}, and device {self.device}"
+            )
+        return output
+
+    def sum_forces(self, force, out=None):
+        """Sum matched forces into ``(N, n_a, n_b, 3)``."""
+        if not self._prepared or force.shape[:2] != self._pair_shape:
+            raise RuntimeError("prepare should be called for the current contact pairs")
+        shape = (self._pair_shape[1], self.n_a, self.n_b, 3)
+        out = self._check_output(out, shape, force.dtype)
+        out.zero_()
+        if self.n_a == 0 or self.n_b == 0:
+            return out
+
+        self._ensure_float_workspace(force.dtype)
+        flat_out = out.view(-1, 3)
+        torch.mul(
+            force.unsqueeze(2),
+            self._combined_mask.unsqueeze(-1),
+            out=self._combined_vector_source,
+        )
+        flat_out.scatter_add_(
+            0,
+            self._combined_target.reshape(-1, 1).expand(-1, 3),
+            self._combined_vector_source.reshape(-1, 3),
+        )
+        return out
+
+    def group_positions(self, contact_pos, contact_force_norm, out=None, valid_out=None):
+        """Force-weight matched positions into ``(N, n_a, n_b, 3)``."""
+        if not self._prepared or contact_pos.shape[:2] != self._pair_shape:
+            raise RuntimeError("prepare should be called for the current contact pairs")
+        shape = (self._pair_shape[1], self.n_a, self.n_b)
+        out = self._check_output(out, (*shape, 3), contact_pos.dtype)
+        valid_out = self._check_output(valid_out, shape, torch.bool)
+        out.zero_()
+        valid_out.zero_()
+        if self.n_a == 0 or self.n_b == 0:
+            return out, valid_out
+
+        self._ensure_float_workspace(contact_pos.dtype)
+        self._force_sums.zero_()
+        flat_out = out.view(-1, 3)
+        flat_sums = self._force_sums.view(-1)
+
+        torch.mul(
+            contact_pos,
+            contact_force_norm.unsqueeze(-1),
+            out=self._weighted_position,
+        )
+        torch.mul(
+            self._weighted_position.unsqueeze(2),
+            self._combined_mask.unsqueeze(-1),
+            out=self._combined_vector_source,
+        )
+        flat_out.scatter_add_(
+            0,
+            self._combined_target.reshape(-1, 1).expand(-1, 3),
+            self._combined_vector_source.reshape(-1, 3),
+        )
+        torch.mul(
+            contact_force_norm.unsqueeze(-1),
+            self._combined_mask,
+            out=self._combined_scalar_source,
+        )
+        flat_sums.scatter_add_(
+            0,
+            self._combined_target.reshape(-1),
+            self._combined_scalar_source.reshape(-1),
+        )
+
+        torch.gt(self._force_sums, 0, out=valid_out)
+        torch.logical_not(valid_out, out=self._invalid_sums)
+        self._force_sums.masked_fill_(self._invalid_sums, 1)
+        out.div_(self._force_sums.unsqueeze(-1))
+        out.masked_fill_(self._invalid_sums.unsqueeze(-1), 0)
+        return out, valid_out
+
+    def all_positions(self, contact_pos, out=None, valid_out=None):
+        """Keep each matched contact position grouped only by its A index."""
+        if not self._prepared or contact_pos.shape[:2] != self._pair_shape:
+            raise RuntimeError("prepare should be called for the current contact pairs")
+        n_pairs, n_envs = self._pair_shape
+        shape = (n_envs, self.n_a, n_pairs)
+        out = self._check_output(out, (*shape, 3), contact_pos.dtype)
+        valid_out = self._check_output(valid_out, shape, torch.bool)
+        out.zero_()
+        valid_out.zero_()
+        if self.n_a == 0 or self.n_b == 0:
+            return out, valid_out
+
+        self._ensure_float_workspace(contact_pos.dtype)
+        if self._position_shape != shape:
+            self._position_target = torch.empty_like(self._direct_target)
+            self._position_flipped = torch.empty_like(self._flipped)
+            self._position_combined_target = torch.empty_like(self._combined_target)
+            self._position_combined_mask = torch.empty_like(self._combined_mask)
+            self._position_counts = torch.empty(
+                shape, dtype=torch.uint8, device=self.device
+            )
+            self._count_source = torch.empty(
+                (*self._pair_shape, 2), dtype=torch.uint8, device=self.device
+            )
+            self._position_shape = shape
+
+        self._position_counts.zero_()
+        flat_out = out.view(-1, 3)
+        flat_counts = self._position_counts.view(-1)
+
+        self._position_target.copy_(self._a_from_a)
+        self._position_target.mul_(n_pairs).add_(self._pair_ordinals)
+        self._position_target.add_(self._env_pos_offsets)
+        self._position_target.mul_(self._direct)
+        self._position_combined_target[..., 0].copy_(self._position_target)
+        self._position_combined_mask[..., 0].copy_(self._direct)
+
+        # For this output the B dimension is reduced with any(), so two
+        # orientations sharing an A cell must still contribute only once.
+        self._position_flipped.copy_(self._flipped)
+        torch.eq(self._a_from_a, self._a_from_b, out=self._temporary_mask)
+        self._temporary_mask.logical_and_(self._direct)
+        torch.logical_not(self._temporary_mask, out=self._valid_contacts)
+        self._position_flipped.logical_and_(self._valid_contacts)
+        self._position_target.copy_(self._a_from_b)
+        self._position_target.mul_(n_pairs).add_(self._pair_ordinals)
+        self._position_target.add_(self._env_pos_offsets)
+        self._position_target.mul_(self._position_flipped)
+        self._position_combined_target[..., 1].copy_(self._position_target)
+        self._position_combined_mask[..., 1].copy_(self._position_flipped)
+        torch.mul(
+            contact_pos.unsqueeze(2),
+            self._position_combined_mask.unsqueeze(-1),
+            out=self._combined_vector_source,
+        )
+        flat_out.scatter_add_(
+            0,
+            self._position_combined_target.reshape(-1, 1).expand(-1, 3),
+            self._combined_vector_source.reshape(-1, 3),
+        )
+        self._count_source.copy_(self._position_combined_mask)
+        flat_counts.scatter_add_(
+            0,
+            self._position_combined_target.reshape(-1),
+            self._count_source.reshape(-1),
+        )
+        torch.gt(self._position_counts, 0, out=valid_out)
+        return out, valid_out
     
 def get_filtered_contacts(
-    entity_a, 
-    entity_b=None, 
-    filter_geoms_a=[], 
-    filter_geoms_b=[],
-    filter_links_a=[],
-    filter_links_b=[], 
+    entity_a,
+    entity_b=None,
+    filter_geoms_a=(),
+    filter_geoms_b=(),
+    filter_links_a=(),
+    filter_links_b=(),
     return_geom_force=False,
     return_link_force=False,
     return_geom_pos=False,
     return_link_pos=False,
-    device='cuda:0', # NOTE: to_torch() default device is cpu
+    device='cuda:0',  # NOTE: to_torch() default device is cpu
+    geom_filter=None,
+    link_filter=None,
+    geom_force_out=None,
+    link_force_out=None,
+    geom_pos_out=None,
+    geom_pos_valid_out=None,
+    link_pos_out=None,
+    link_pos_valid_out=None,
 ):
-    """
-    Get the filtered contacts between two entities.
-    Each entity has a number of geoms, if specified, only contacts between the specified geoms are returned.
-    
-    return: 
-    - contact_pos_geom_a: (N, n_geom_a, max_n, 3) -> up to max_n contacts between each geom in entity_a and other geoms of entity_b
-    - contact_pos_geom_valid: (N, n_geom_a, max_n, ) -> mask for valid contact positions, because some pairs might not have contacts
+    """Get filtered contact forces/positions between two entities.
 
-    - contact_pos_link: (N, n_link_a, n_link_b, 3) -> Average all the found positions between link_a and link_b using the contact force norm
-    - contact_pos_link_valid: (N, n_link_a, n_link_b) -> mask for valid contact positions
-    
-    - contact_force_a_geom: (N, n_geom_a, n_geom_b, 3) -> aggregated contact force on geom_a (flip sign for geom_b)
-    - contact_force_a_link: (N, n_link_a, n_link_b, 3) -> aggregated contact force on link_a (flip sign for link_b)
+    Supplying a reusable ``geom_filter``/``link_filter`` avoids rebuilding the
+    lookup tables.  Supplying output tensors lets this function write directly
+    into environment-owned buffers.
     """
-    contact_data = entity_a._solver.collider.contact_data # get all the data!
-    # NOTE need to use this to mask out invalid contacts!
-    n_contacts = entity_a._solver.collider.n_contacts.to_torch(device=device) # size [N] 
-    # this returns a dict of key, tensor pairs: (can also do it separately: contact_data.geom_0.to_torch())
-    # geom_a : torch.Size([500, N])
-    # geom_b : torch.Size([500, N])
-    # penetration : torch.Size([500, N])
-    # normal : torch.Size([500, N, 3])
-    # pos : torch.Size([500, N, 3])
-    # friction : torch.Size([500, 1])
-    # sol_params : torch.Size([500, N, 7])
-    # force : torch.Size([500, N, 3])
-    # link_a : torch.Size([500, N])
-    # link_b : torch.Size([500, N])
-    # num_envs = n_contacts.shape[0]  
-    force = contact_data.force.to_torch(device=device) # size [500, N, 3]
+    contact_data = entity_a._solver.collider.contact_data
+    n_contacts = entity_a._solver.collider.n_contacts.to_torch(device=device)
+    force = contact_data.force.to_torch(device=device)
     contact_info = dict()
 
     if return_geom_force or return_geom_pos:
-        geom_a = contact_data.geom_a.to_torch(device=device) # size [500, N]
-        geom_b = contact_data.geom_b.to_torch(device=device) # size [500, N]
-        if len(filter_geoms_a) == 0:
-            geom_a_idxs = torch.tensor([i for i in range(entity_a.geom_start, entity_a.geom_end)]).to(force.device)
-        else:
-            geom_a_idxs = torch.tensor(filter_geoms_a).to(force.device)
-        if len(filter_geoms_b) == 0:
-            geom_b_idxs = torch.tensor([i for i in range(entity_b.geom_start, entity_b.geom_end)]).to(force.device)
-        else:
-            geom_b_idxs = torch.tensor(filter_geoms_b).to(force.device)
-        geom_mask = get_expanded_mask(n_contacts, geom_a, geom_b, geom_a_idxs, geom_b_idxs)
+        geom_a = contact_data.geom_a.to_torch(device=device)
+        geom_b = contact_data.geom_b.to_torch(device=device)
+        if geom_filter is None:
+            geom_a_idxs = (
+                torch.arange(entity_a.geom_start, entity_a.geom_end, device=force.device)
+                if len(filter_geoms_a) == 0
+                else torch.as_tensor(filter_geoms_a, device=force.device)
+            )
+            if len(filter_geoms_b) == 0:
+                if entity_b is None:
+                    raise ValueError("entity_b is required without filter_geoms_b")
+                geom_b_idxs = torch.arange(
+                    entity_b.geom_start, entity_b.geom_end, device=force.device
+                )
+            else:
+                geom_b_idxs = torch.as_tensor(filter_geoms_b, device=force.device)
+            geom_filter = ContactIndexFilter(geom_a_idxs, geom_b_idxs)
+        geom_filter.prepare(n_contacts, geom_a, geom_b)
 
     if return_link_force or return_link_pos:
-        link_a = contact_data.link_a.to_torch(device=device) # size [500, N]
-        link_b = contact_data.link_b.to_torch(device=device) # size [500, N]
+        link_a = contact_data.link_a.to_torch(device=device)
+        link_b = contact_data.link_b.to_torch(device=device)
+        if link_filter is None:
+            link_a_idxs = (
+                torch.arange(entity_a.link_start, entity_a.link_end, device=force.device)
+                if len(filter_links_a) == 0
+                else torch.as_tensor(filter_links_a, device=force.device)
+            )
+            if len(filter_links_b) == 0:
+                if entity_b is None:
+                    raise ValueError("entity_b is required without filter_links_b")
+                link_b_idxs = torch.arange(
+                    entity_b.link_start, entity_b.link_end, device=force.device
+                )
+            else:
+                link_b_idxs = torch.as_tensor(filter_links_b, device=force.device)
+            link_filter = ContactIndexFilter(link_a_idxs, link_b_idxs)
+        link_filter.prepare(n_contacts, link_a, link_b)
 
-        if len(filter_links_a) > 0:
-            # assert is tensor:
-            assert isinstance(filter_links_a, torch.Tensor), "filter_links_a should be a tensor" 
-            link_a_idxs = filter_links_a.to(force.device)
-        else:
-            link_a_idxs = torch.tensor([i for i in range(entity_a.link_start, entity_a.link_end)]).to(force.device)
+    if return_geom_force:
+        contact_info['contact_force_geom_a'] = geom_filter.sum_forces(
+            force, out=geom_force_out
+        )
+    if return_link_force:
+        contact_info['contact_force_link_a'] = link_filter.sum_forces(
+            force, out=link_force_out
+        )
 
-        if len(filter_links_b) > 0:
-            link_b_idxs = filter_links_b.to(force.device)
-        else:
-            assert entity_b is not None, "entity_b should be specified if filter_links_b is not"
-            link_b_idxs = torch.tensor([i for i in range(entity_b.link_start, entity_b.link_end)]).to(force.device)
-        link_mask = get_expanded_mask(n_contacts, link_a, link_b, link_a_idxs, link_b_idxs)
-
-    if return_geom_force: # 500 FPS
-        ### Get contact force by geom ### 
-        # force_a_geom = index_contact_force(
-        #     force, geom_a, geom_b, geom_a_idxs, geom_b_idxs
-        #     ) # shape (N, n_geom_a, n_geom_b, 3)
-        force_a_geom = get_filtered_contact_force_from_mask(force, geom_mask)
-        contact_info['contact_force_geom_a'] = force_a_geom
-
-    if return_link_force: 
-        ### Get contact positions by link ###
-        # force_a_link = index_contact_force(
-        #     force, link_a, link_b, link_a_idxs, link_b_idxs
-        #     ) # shape (N, n_link_a, n_link_b, 3)
-        force_a_link = get_filtered_contact_force_from_mask(force, link_mask)
-        contact_info['contact_force_link_a'] = force_a_link
-    
     if return_geom_pos or return_link_pos:
-         ### Get contact positions by geom ###
-        contact_pos = contact_data.pos.to_torch(device=device) # size [500, N, 3]
-        
-
-    if return_geom_pos: # 
-        # geom_a_pos, geom_a_valid = get_per_geom_a_contact_pos(contact_pos, force, geom_a, geom_b, geom_a_idxs, geom_b_idxs)
-        geom_a_pos, geom_a_valid = get_all_contact_pos_from_mask(contact_pos, geom_mask)
-        contact_info['contact_pos_geom_a'] = geom_a_pos
-        contact_info['contact_pos_geom_a_valid'] = geom_a_valid
-    
+        contact_pos = contact_data.pos.to_torch(device=device)
+    if return_geom_pos:
+        geom_pos, geom_valid = geom_filter.all_positions(
+            contact_pos, out=geom_pos_out, valid_out=geom_pos_valid_out
+        )
+        contact_info['contact_pos_geom_a'] = geom_pos
+        contact_info['contact_pos_geom_a_valid'] = geom_valid
     if return_link_pos:
-        force_norm = torch.norm(force, dim=-1)
-        # link_pos, link_valid = get_per_link_a_contact_pos(contact_pos, force_norm, link_a, link_b, link_a_idxs, link_b_idxs)
-
-        link_pos, link_valid = get_grouped_contact_pos(contact_pos, force_norm, link_mask)
+        force_norm = link_filter.contact_force_norm(force)
+        link_pos, link_valid = link_filter.group_positions(
+            contact_pos,
+            force_norm,
+            out=link_pos_out,
+            valid_out=link_pos_valid_out,
+        )
         contact_info['contact_pos_link_a'] = link_pos
         contact_info['contact_pos_link_a_valid'] = link_valid
-
 
     return contact_info
 
 
-def index_contact_force(n_contacts, force, geom_a, geom_b, geom_a_idxs, geom_b_idxs):
-    """ 
-    Input: 
-    - force: (n_contacts, N, 3) tensor of contact forces
-    - geom_a: (n_contacts, N) tensor of geom indices for entity A
-    - geom_b: (n_contacts, N) tensor of geom indices for entity B
-    - geom_a_idxs: 1D list of geom indices to filter for entity A
-    - geom_b_idxs: 1D list of geom indices to filter for entity B
-    Return:
-    - summed force tensor of shape (N, n_geom_a, n_geom_b, 3) """
-    device = force.device 
-    mask = get_expanded_mask(n_contacts, geom_a, geom_b, geom_a_idxs, geom_b_idxs)
-    # mask_expand = mask.unsqueeze(-1) # shape (n_contacts, N, n_a, n_b, 1)
-    # force_expand = force.unsqueeze(-2).unsqueeze(-2) # shape (n_contacts, N, 1, 1, 3)
-    # sum_force = (force_expand * mask_expand).sum(dim=0) # shape (N, n_a, n_b, 3)
-    sum_force = get_filtered_contact_force_from_mask(force, mask)
-    return sum_force
-
-
-def get_per_link_a_contact_pos(n_contacts, contact_pos, contact_force_norm, link_a, link_b, link_a_idxs, link_b_idxs):
-    """
-    Get all the contact positions between each link_a and link_b
-    Input: 
-    - contact_pos: (n_contacts, N, 3) tensor of contact positions
-    - contact_force_norm: (n_contacts, N) tensor of contact force norms
-    - link_a: (n_contacts, N) tensor of link indices for entity A
-    - link_b: (n_contacts, N) tensor of link indices for entity B
-    - link_a_idxs: 1D list of link indices to filter for entity A
-    - link_b_idxs: 1D list of link indices to filter for entity B
-    Return:
-    - contact_pos_link: (N, n_link_a, n_link_b, 3) tensor of contact positions
-    - contact_pos_link_valid: (N, n_link_a, n_link_b) tensor of valid contact positions
-    """     
-    device = contact_pos.device  
-    mask = get_expanded_mask(n_contacts, link_a, link_b, link_a_idxs, link_b_idxs)
-    assert len(contact_pos.shape) == 3, "contact_pos should have shape (n_contacts, N, 3)"  
-    n_envs = contact_pos.shape[1]
-    n_contacts = contact_pos.shape[0]
-    # because there's at most n_contacts across all geoms in each env, we allocate the max size for each geom_a and fill in geom_b contacts
-    contact_force_norm = contact_force_norm.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # (n_contacts, N, 1, 1, 1)
-    pos_expanded = contact_pos.unsqueeze(-2).unsqueeze(-2) # (n_contacts, N, 1, 1, 3)
-    # Compute weighted contact positions
-
-    pos_masked = pos_expanded * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_link_a, n_link_b, 3)
-
-    weighted_contact_pos = pos_expanded * contact_force_norm  # (n_contacts, N, 1, 1, 3) 
-    weighted_contact_pos = weighted_contact_pos * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_link_a, n_link_b, 3)
-
-    # Sum weighted positions and contact forces across all contacts (dim=0)
-    weighted_sum = torch.sum(weighted_contact_pos, dim=0)  # (N, n_link_a, n_link_b, 3)
-    force_sum = torch.sum(contact_force_norm * mask.unsqueeze(-1), dim=0)  # (N, n_link_a, n_link_b, 1)
-    
-    # Compute the weighted average (avoid division by zero)
-    contact_pos_link = torch.where(
-        force_sum > 0,
-        weighted_sum / force_sum,
-        torch.zeros_like(weighted_sum)
-    ) 
-    # Compute validity (at least one valid contact)
-    contact_pos_link_valid = (force_sum > 0).squeeze(-1) # (N, n_link_a, n_link_b)
-    
-    return contact_pos_link, contact_pos_link_valid
-
-
-def get_per_geom_a_contact_pos(n_contacts, contact_pos, contact_force_norm, geom_a, geom_b, geom_a_idxs, geom_b_idxs):
-    """
-    Get all the contact positions between each a_geom all the geoms on b
-    Input: 
-    - contact_pos: (n_contacts, N, 3) tensor of contact positions
-    - contact_force_norm: (n_contacts, N) tensor of contact force norms
-    - geom_a: (n_contacts, N) tensor of geom indices for entity A
-    - geom_b: (n_contacts, N) tensor of geom indices for entity B
-    - geom_a_idxs: 1D list of geom indices to filter for entity A
-    - geom_b_idxs: 1D list of geom indices to filter for entity B
-    Return:
-    - contact_pos_geom: (N, n_geom_a, n_contacts, 3) tensor of contact positions
-    - contact_pos_geom_valid: (N, n_geom_a, n_contacts) tensor of valid contact positions
-    """     
-    device = contact_pos.device  
-    mask = get_expanded_mask(n_contacts, geom_a, geom_b, geom_a_idxs, geom_b_idxs)
-
-    assert len(contact_pos.shape) == 3, "contact_pos should have shape (n_contacts, N, 3)"  
-    n_envs = contact_pos.shape[1]
-    n_contacts = contact_pos.shape[0]
-    # because there's at most n_contacts across all geoms in each env, we allocate the max size for each geom_a and fill in geom_b contacts
-    n_geom_a = len(geom_a_idxs)
-    
-    contact_pos_geom = torch.zeros(n_contacts, n_envs, n_geom_a, 3).to(device)  # (n_contacts, N, n_geom_a, 3)
-    contact_pos_geom_valid = torch.zeros(n_contacts, n_envs, n_geom_a).to(device)  # (n_contacts, N, n_geom_a)
-    
-    # Loop over each geometry_a index to filter and aggregate the contact positions
-    for idx in range(n_geom_a):
-        collide_b_mask = mask[:, :, idx, :]  # shape (n_contacts, N, n_b)
-        any_b_mask = collide_b_mask.any(dim=-1)  # shape (n_contacts, N)
-        contact_pos_geom[:, :, idx] = contact_pos * any_b_mask.unsqueeze(-1)  # shape (n_contacts, N, 3)
-        contact_pos_geom_valid[:, :, idx] = any_b_mask  # shape (n_contacts, N)
-    
-    return contact_pos_geom, contact_pos_geom_valid
+def index_contact_force(
+    n_contacts,
+    force,
+    geom_a,
+    geom_b,
+    geom_a_idxs,
+    geom_b_idxs,
+    contact_filter=None,
+    out=None,
+):
+    """Compatibility entry point for index-based force aggregation."""
+    if contact_filter is None:
+        contact_filter = ContactIndexFilter(geom_a_idxs, geom_b_idxs)
+    contact_filter.prepare(n_contacts, geom_a, geom_b)
+    return contact_filter.sum_forces(force, out=out)

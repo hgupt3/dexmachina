@@ -6,7 +6,7 @@ from dexmachina.envs.robot import BaseRobot
 from dexmachina.envs.object import ArticulatedObject
 from dexmachina.envs.rewards import RewardModule
 from dexmachina.envs.math_utils import matrix_from_quat
-from dexmachina.envs.contacts import get_filtered_contacts
+from dexmachina.envs.contacts import ContactIndexFilter, get_filtered_contacts
 from dexmachina.envs.randomizations import RandomizationModule
 from dexmachina.envs.curriculum import Curriculum 
 from dexmachina.envs.maniptrans_curr import ManipTransCurriculum 
@@ -388,6 +388,9 @@ class BaseEnv:
                 self.robots['left'].coll_idxs_global + self.robots['right'].coll_idxs_global, 
                 device=self.device
                 )
+            self.contact_link_filter = ContactIndexFilter(
+                self.filter_links_a, self.filter_links_b
+            )
             self.num_left_contact_links = len(self.robots['left'].coll_idxs_global)
 
             print("num_obj_links", self.num_obj_links) 
@@ -520,6 +523,10 @@ class BaseEnv:
 
         if self.observe_contact_force:
             self.contact_forces = torch.zeros((self.num_envs, self.num_obj_links,  self.num_robot_links, 3), device=self.device) 
+            self.contact_force_norm = torch.zeros(
+                (self.num_envs, self.num_obj_links, self.num_robot_links),
+                device=self.device,
+            )
 
         if self.use_contact_reward:
             self.contact_link_pos = torch.zeros((self.num_envs, self.num_obj_links, self.num_robot_links, 3), device=self.device)
@@ -556,18 +563,33 @@ class BaseEnv:
             self._render_headless()
         return  
     
-    def pre_scene_step(self, actions: torch.Tensor):
+    def pre_scene_step(
+        self,
+        actions: torch.Tensor,
+        external_hand_targets=None,
+    ):
         """ call this for only stepping the robot/objects"""
         self.last_actions[:] = self.actions
         self.actions[:] = torch.clamp(actions, -self.action_clip, self.action_clip) * self.action_scale
-        
+        if external_hand_targets is not None:
+            assert set(external_hand_targets) == set(self.robots), (
+                "external_hand_targets keys must exactly match robot names"
+            )
         for k, robot in self.robots.items():
             idxs = self.action_idxs_to_robot[k]
-            robot.step(self.actions[:, idxs], self._step_env_idxs)
+            robot.step(
+                self.actions[:, idxs],
+                self._step_env_idxs,
+                external_finger_targets=(
+                    None
+                    if external_hand_targets is None
+                    else external_hand_targets[k]
+                ),
+            )
         for k, obj in self.objects.items():
             obj.step() 
             
-    def step(self, actions: torch.Tensor):
+    def step(self, actions: torch.Tensor, external_hand_targets=None):
         """
         actions: torch.Tensor of shape (num_envs, action_dim)
         """
@@ -575,10 +597,21 @@ class BaseEnv:
         assert actions.shape[0] == self.num_envs
         self.last_actions[:] = self.actions
         self.actions[:] = torch.clamp(actions, -self.action_clip, self.action_clip) * self.action_scale
-        
+        if external_hand_targets is not None:
+            assert set(external_hand_targets) == set(self.robots), (
+                "external_hand_targets keys must exactly match robot names"
+            )
         for k, robot in self.robots.items():
             idxs = self.action_idxs_to_robot[k]
-            robot.step(self.actions[:, idxs], self._step_env_idxs)
+            robot.step(
+                self.actions[:, idxs],
+                self._step_env_idxs,
+                external_finger_targets=(
+                    None
+                    if external_hand_targets is None
+                    else external_hand_targets[k]
+                ),
+            )
         for k, obj in self.objects.items():
             obj.step()
             
@@ -622,13 +655,14 @@ class BaseEnv:
                 )
         # log contact forces
         if self.observe_contact_force:
-            self.extras["log"]["contact_force"] = torch.norm(self.contact_forces, dim=-1).max().item()
+            self.extras["log"]["contact_force"] = self.contact_force_norm.max()
         
         # get control_force 
         for side in ['left', 'right']:
             robot = self.robots[side]
-            control_force = robot.get_control_force()
-            self.extras["log"][f"{side}_control_force"] = control_force.mean().item()
+            self.extras["log"][f"{side}_control_force"] = (
+                robot.control_forces.mean()
+            )
 
         if self.record_video:
             self._render_headless()
@@ -666,6 +700,7 @@ class BaseEnv:
             wrist_pose_left=self.robots['left'].wrist_pose,
             wrist_pose_right=self.robots['right'].wrist_pose,
             contact_forces=None,
+            contact_force_norm=None,
             )
         if self.use_contact_reward:
             reward_kwargs.update(
@@ -676,7 +711,8 @@ class BaseEnv:
             )
         if self.observe_contact_force:
             reward_kwargs.update(
-                contact_forces=self.contact_forces
+                contact_forces=self.contact_forces,
+                contact_force_norm=self.contact_force_norm,
             )
         rewards, rew_dict = self.reward_module.compute_reward(
             **reward_kwargs
@@ -785,23 +821,29 @@ class BaseEnv:
 
         if self.observe_contact_force or self.use_contact_reward:
             entity_a = self.object.entity
-            contact_info = get_filtered_contacts(
+            get_filtered_contacts(
                     entity_a=entity_a, 
                     entity_b=None,
-                    filter_links_a=self.filter_links_a,
-                    filter_links_b=self.filter_links_b,
+                    link_filter=self.contact_link_filter,
                     return_link_force=self.observe_contact_force,
                     return_link_pos=self.use_contact_reward,
+                    link_force_out=(
+                        self.contact_forces if self.observe_contact_force else None
+                    ),
+                    link_pos_out=(
+                        self.contact_link_pos if self.use_contact_reward else None
+                    ),
+                    link_pos_valid_out=(
+                        self.contact_link_valid if self.use_contact_reward else None
+                    ),
                     device=self.device ,
                 )
-                
             if self.observe_contact_force:
-                contact_force = contact_info["contact_force_link_a"] # shape (n_env, n_obj_links, n_robot_links, 3)
-                self.contact_forces[:] = contact_force
-            if self.use_contact_reward and self.num_obj_links > 0:
-                self.contact_link_pos[:] = contact_info['contact_pos_link_a']
-                self.contact_link_valid[:] = contact_info['contact_pos_link_a_valid']
-                # vis left hand contact for now:
+                torch.norm(
+                    self.contact_forces,
+                    dim=-1,
+                    out=self.contact_force_norm,
+                )
             
         contact_dict = dict()
         for key in self.contact_markers.keys():
@@ -853,8 +895,10 @@ class BaseEnv:
                 ])
 
         if self.observe_contact_force:
-            force_norm = torch.norm(self.contact_forces, dim=-1) * 0.01 # scale down! max contact force can go to 1000+
-            value_list.append(force_norm.flatten(start_dim=1))
+            # Scale down: max contact force can exceed 1000.
+            value_list.append(
+                (self.contact_force_norm * 0.01).flatten(start_dim=1)
+            )
 
         obs = torch.cat(value_list, dim=-1)
         self.obs_dict = all_obs_dict
@@ -947,6 +991,7 @@ class BaseEnv:
         
         if self.observe_contact_force:
             self.contact_forces[env_idxs] = 0.0
+            self.contact_force_norm[env_idxs] = 0.0
         
         if self.use_contact_reward:
             self.contact_link_pos[env_idxs] = 0.0

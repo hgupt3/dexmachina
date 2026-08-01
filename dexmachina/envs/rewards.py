@@ -390,7 +390,7 @@ class RewardModule:
         demo_contacts = self.match_demo_state(f"contact_links_{side}", episode_length_buf) 
         # NOTE the retargeted contacts are of shape (N, num_obj_parts=2, num_links, 4), first row is 'top' and second row is 'bottom'!
         # need to flip the order since policy contact has object link bottom first 
-        demo_contacts = demo_contacts.clone()[:, [1, 0], :, :] # (N, num_obj_links, num_hand_links, 4)
+        demo_contacts = demo_contacts[:, [1, 0], :, :] # (N, num_obj_links, num_hand_links, 4)
         assert demo_contacts.shape[1] == contact_link_pos.shape[1], f"Shape mismatch: {demo_contacts.shape} vs {contact_link_pos.shape}"
         assert demo_contacts.shape[2] == contact_link_pos.shape[2], f"Shape mismatch: {contact_link_pos.shape} vs {demo_contacts.shape}"
         demo_valids = demo_contacts[:, :, :, -1] > 0.0 # (part id is <= 0 if no contact)
@@ -422,12 +422,12 @@ class RewardModule:
         dist = position_distance(demo_pos, policy_pos)
         if self.mask_zero_contact:
             # if both invalid, set distance to 0
-            dist = torch.where(both_invalid_mask, torch.ones_like(dist) * max_distance, dist)
+            dist = torch.where(both_invalid_mask, torch.full_like(dist, max_distance), dist)
         else:
             # if both invalid, set distance to 0
             dist = torch.where(both_invalid_mask, torch.zeros_like(dist), dist)
         # if one valid, set distance to a large value
-        dist = torch.where(one_valid_mask, torch.ones_like(dist) * max_distance, dist) # (B, 2, nlinks)
+        dist = torch.where(one_valid_mask, torch.full_like(dist, max_distance), dist) # (B, 2, nlinks)
         
         # different ways to compute the distance: 
         # if take mean, encourages all contacts to be close to the targets 
@@ -481,10 +481,12 @@ class RewardModule:
         contacts_link_right,
         contacts_link_valid_right,
         episode_length_buf,
+        demo_obj_pose=None,
     ):
-        demo_obj_pos = self.match_demo_state("obj_pos", episode_length_buf)
-        demo_obj_quat = self.match_demo_state("obj_quat", episode_length_buf)
-        demo_obj_pose = torch.cat([demo_obj_pos, demo_obj_quat], dim=1)
+        if demo_obj_pose is None:
+            demo_obj_pos = self.match_demo_state("obj_pos", episode_length_buf)
+            demo_obj_quat = self.match_demo_state("obj_quat", episode_length_buf)
+            demo_obj_pose = torch.cat([demo_obj_pos, demo_obj_quat], dim=1)
         contact_rew_left, contact_dict_left = self.compute_hand_contact_reward(
             contacts_link_left, contacts_link_valid_left, 
             wrist_pose_left, obj_pose, episode_length_buf, demo_obj_pose, side='left'
@@ -517,7 +519,7 @@ class RewardModule:
         """
         # first, add a part_id dim so (N, 2, num_links, 4) and last dim is part_id label
         labeled = torch.cat(
-            [contact_link_pos, torch.zeros_like(contact_link_pos)[:, :, :, 0:1]], dim=-1
+            [contact_link_pos, torch.zeros_like(contact_link_pos[..., 0:1])], dim=-1
         ) # (N, 2, num_links, 4) 
         # fill in the labels 1 or 2 if valid contact
         valid_reshaped = contact_link_valid[..., None] # (N, 2, num_links, 1)
@@ -562,6 +564,7 @@ class RewardModule:
         wrist_pose_right,
         contact_forces, # shape (N, num_obj_links, num_hand_links, 3)
         episode_length_buf,
+        contact_force_norm=None,
     ):  
         demo_pos = self.match_demo_state("obj_pos", episode_length_buf)
         demo_quat = self.match_demo_state("obj_quat", episode_length_buf) 
@@ -610,7 +613,8 @@ class RewardModule:
                     wrist_pose_right,
                     left_reshaped, left_valid, 
                     right_reshaped, right_valid,
-                    episode_length_buf
+                    episode_length_buf,
+                    demo_obj_pose=demo_pose,
                 ) 
             if "well_track" in rew_dict and self.mask_well_track:
                 # use well_track to mask out the contact reward
@@ -638,7 +642,9 @@ class RewardModule:
         
         
         if self.cfg["force_penalty"] > 0.0 and contact_forces is not None: # shape (B, 2, num_links*2, 3)
-            force_norm = torch.norm(contact_forces, dim=-1).flatten(start_dim=1) # shape (B, 2*num_links*2) -> this goes to up to 5k
+            if contact_force_norm is None:
+                contact_force_norm = torch.norm(contact_forces, dim=-1)
+            force_norm = contact_force_norm.flatten(start_dim=1) # shape (B, 2*num_links*2) -> this goes to up to 5k
             high_force = torch.where(force_norm > 500.0, force_norm - 500.0, torch.zeros_like(force_norm))
             high_force = torch.mean(high_force, dim=-1) # shape (B, )
             force_penalty = self.cfg["force_penalty"] * high_force 
@@ -663,4 +669,4 @@ class RewardModule:
             keys.append('con')
         if self.bc_rew_weight > 0:
             keys.append('bc')
-        return keys 
+        return keys

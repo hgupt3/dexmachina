@@ -512,7 +512,7 @@ class BaseRobot:
         self.wrist_pose[:, 3:] = entity.get_links_quat()[:, self.wrist_link_idx, :]
         if len(self.kpt_markers) > 0:
             # update the kpt pos
-            kpt_pos = self.entity.get_links_pos()[:, self.kpt_link_idxs, :]
+            kpt_pos = link_pos[:, self.kpt_link_idxs, :]
             for i, marker in enumerate(self.kpt_markers):
                 marker.set_pos(kpt_pos[:, i, :])
 
@@ -554,7 +554,12 @@ class BaseRobot:
         )
         return sum(dims.values()), dims
 
-    def translate_actions(self, actions, episode_length_buf):
+    def translate_actions(
+        self,
+        actions,
+        episode_length_buf,
+        external_finger_targets=None,
+    ):
         assert self.initialized, "Robot not initialized"
         assert actions.shape[-1] == self.action_dim, f"actions.shape={actions.shape} != {self.action_dim}" 
         # first map low-dim action to joint targets 
@@ -622,6 +627,25 @@ class BaseRobot:
         target_dof_pos = torch.clamp(target_dof_pos, lower_limit, upper_limit) 
         new_targets = self.action_moving_avg * target_dof_pos + (1 - self.action_moving_avg) * self.curr_targets 
         new_targets = torch.clamp(new_targets, lower_limit, upper_limit)
+        if external_finger_targets is not None:
+            assert self.action_mode == "hybrid", (
+                "external finger targets require hybrid mode so DexMachina "
+                "continues to own the wrist action path"
+            )
+            expected_shape = (actions.shape[0], len(self.finger_dof_idxs))
+            assert external_finger_targets.shape == expected_shape, (
+                f"external_finger_targets.shape={external_finger_targets.shape} "
+                f"!= {expected_shape}"
+            )
+            assert external_finger_targets.device == self.curr_targets.device
+            assert external_finger_targets.dtype == self.curr_targets.dtype
+            finger_lower = lower_limit[self.finger_dof_idxs]
+            finger_upper = upper_limit[self.finger_dof_idxs]
+            new_targets[:, self.finger_dof_idxs] = torch.clamp(
+                external_finger_targets,
+                finger_lower,
+                finger_upper,
+            )
         self.prev_targets[:] = self.curr_targets
         self.curr_targets[:] = new_targets 
         return new_targets
@@ -747,9 +771,13 @@ class BaseRobot:
         self.curr_targets[:] = joint_targets
         return  
     
-    def step(self, actions, env_idxs=None):
+    def step(self, actions, env_idxs=None, external_finger_targets=None):
         assert self.initialized, "Robot not initialized"
-        target_dof_pos = self.translate_actions(actions, self.episode_length_buf)
+        target_dof_pos = self.translate_actions(
+            actions,
+            self.episode_length_buf,
+            external_finger_targets=external_finger_targets,
+        )
         if env_idxs is not None:
             target_dof_pos = target_dof_pos[env_idxs]
         
@@ -825,4 +853,4 @@ class BaseRobot:
         self.episode_data['qpos'].append(self.dof_pos[env_ids].clone())
         self.episode_data['qpos_targets'].append(self.curr_targets[env_ids].clone())
         self.episode_data['kpt_pos'].append(self.kpt_pos[env_ids].clone())
-        self.episode_data['wrist_pose'].append(self.wrist_pose[env_ids].clone()) 
+        self.episode_data['wrist_pose'].append(self.wrist_pose[env_ids].clone())

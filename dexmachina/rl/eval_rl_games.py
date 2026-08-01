@@ -128,8 +128,21 @@ def main():
     parser.add_argument('--output_render', '-or', action='store_true') # if not ture, don't show the retargeted reference
     parser.add_argument('--render_dir', '-out', type=str, default="rendered") # if not provided, save in the same folder as the checkpoint
     parser.add_argument('--video_fname', '-of', type=str, default="-eval.mp4") # if not provided, save in the same folder as the checkpoint
+    parser.add_argument("--action_bench_experiment", type=str, default=None)
+    parser.add_argument("--action_bench_catalog", type=str, default=None)
     
     args = parser.parse_args()
+
+    action_bench_runtime = None
+    if args.action_bench_experiment is not None:
+        from action_bench.benchmarks.dexmachina import (
+            build_adapter_from_resolved_experiment,
+            resolve_experiment_from_files,
+        )
+        action_bench_runtime = resolve_experiment_from_files(
+            experiment_path=args.action_bench_experiment,
+            catalog_path=args.action_bench_catalog,
+        )
 
     ckpt_path = "/".join(args.checkpoint.split("/")[:-2])
     saved_cfg_fname = os.path.join(ckpt_path, "params", "env.pkl")
@@ -204,6 +217,11 @@ def main():
     env = BaseEnv(
          **env_kwargs
     )
+    if action_bench_runtime is not None:
+        env = build_adapter_from_resolved_experiment(
+            env,
+            action_bench_runtime,
+        )
     demo_data = env_kwargs['demo_data']
     obj_state_tensor = gather_object_state_tensor(demo_data)
 
@@ -255,4 +273,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

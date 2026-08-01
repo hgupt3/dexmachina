@@ -152,7 +152,7 @@ class RlGamesVecEnvWrapper(IVecEnv):
 
         This will be the bare :class:`gymnasium.Env` environment, underneath all layers of wrappers.
         """
-        return self.env #.unwrapped
+        return getattr(self.env, "unwrapped", self.env)
 
     """
     Properties
@@ -246,6 +246,14 @@ class RlGamesVecEnvWrapper(IVecEnv):
     def close(self):  # noqa: D102
         return self.env.close()
 
+    def flush_action_metrics(self):
+        flush = getattr(self.env, "flush_action_metrics", None)
+        return {} if flush is None else flush()
+
+    def representation_run_config(self):
+        build_config = getattr(self.env, "representation_run_config", None)
+        return {} if build_config is None else build_config()
+
     """
     Helper functions
     """
@@ -330,3 +338,10 @@ class RlGamesGpuEnv(IVecEnv):
         """
         return self.env.get_env_info()
 
+    def flush_action_metrics(self):
+        flush = getattr(self.env, "flush_action_metrics", None)
+        return {} if flush is None else flush()
+
+    def representation_run_config(self):
+        build_config = getattr(self.env, "representation_run_config", None)
+        return {} if build_config is None else build_config()
