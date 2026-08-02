@@ -39,6 +39,65 @@ def get_contact_marker_cfgs(
     return contact_marker_cfgs
 
 
+class ContactDataCache:
+    """Persistent torch mirrors of the Genesis collider contact buffers.
+
+    Every taichi ``Field.to_torch()`` call allocates a fresh torch tensor and
+    ends with a full taichi runtime sync, so reading the five contact fields
+    the per-step query needs serializes the Python driver against the GPU five
+    times per step. This cache preallocates the destination tensors once and
+    refreshes them with taichi's own copy kernels, issuing a single runtime
+    sync per refresh. The sync is also the required ordering point between the
+    just-stepped simulation kernels and torch-side consumers.
+    """
+
+    def __init__(self, collider, device, need_geom_ids=False, need_link_ids=True, need_pos=True):
+        from taichi.lang.util import to_pytorch_type
+
+        self._collider = collider
+        self._need_geom_ids = need_geom_ids
+        self._need_link_ids = need_link_ids
+        self._need_pos = need_pos
+        device = torch.device(device)
+
+        def _scalar_mirror(field):
+            return torch.empty(field.shape, dtype=to_pytorch_type(field.dtype), device=device)
+
+        def _vector_mirror(field):
+            as_vector = field.m == 1
+            shape_ext = (field.n,) if as_vector else (field.n, field.m)
+            return torch.empty(
+                field.shape + shape_ext, dtype=to_pytorch_type(field.dtype), device=device
+            )
+
+        contact_data = collider.contact_data
+        self.n_contacts = _scalar_mirror(collider.n_contacts)
+        self.force = _vector_mirror(contact_data.force)
+        self.geom_a = _scalar_mirror(contact_data.geom_a) if need_geom_ids else None
+        self.geom_b = _scalar_mirror(contact_data.geom_b) if need_geom_ids else None
+        self.link_a = _scalar_mirror(contact_data.link_a) if need_link_ids else None
+        self.link_b = _scalar_mirror(contact_data.link_b) if need_link_ids else None
+        self.pos = _vector_mirror(contact_data.pos) if need_pos else None
+
+    def refresh(self):
+        """Copy the collider fields into the persistent mirrors; one sync."""
+        from taichi._kernels import matrix_to_ext_arr, tensor_to_ext_arr
+        from taichi.lang import runtime_ops
+
+        contact_data = self._collider.contact_data
+        tensor_to_ext_arr(self._collider.n_contacts, self.n_contacts)
+        matrix_to_ext_arr(contact_data.force, self.force, True)
+        if self._need_geom_ids:
+            tensor_to_ext_arr(contact_data.geom_a, self.geom_a)
+            tensor_to_ext_arr(contact_data.geom_b, self.geom_b)
+        if self._need_link_ids:
+            tensor_to_ext_arr(contact_data.link_a, self.link_a)
+            tensor_to_ext_arr(contact_data.link_b, self.link_b)
+        if self._need_pos:
+            matrix_to_ext_arr(contact_data.pos, self.pos, True)
+        runtime_ops.sync()
+
+
 class ContactIndexFilter:
     """Reusable index-based filtering for one fixed pair of index sets.
 
@@ -407,21 +466,33 @@ def get_filtered_contacts(
     geom_pos_valid_out=None,
     link_pos_out=None,
     link_pos_valid_out=None,
+    data_cache=None,
 ):
     """Get filtered contact forces/positions between two entities.
 
     Supplying a reusable ``geom_filter``/``link_filter`` avoids rebuilding the
     lookup tables.  Supplying output tensors lets this function write directly
-    into environment-owned buffers.
+    into environment-owned buffers.  Supplying a ``ContactDataCache`` replaces
+    the per-field ``to_torch()`` reads (one full runtime sync and one fresh
+    allocation each) with persistent-buffer copies and a single sync.
     """
     contact_data = entity_a._solver.collider.contact_data
-    n_contacts = entity_a._solver.collider.n_contacts.to_torch(device=device)
-    force = contact_data.force.to_torch(device=device)
+    if data_cache is not None:
+        data_cache.refresh()
+        n_contacts = data_cache.n_contacts
+        force = data_cache.force
+    else:
+        n_contacts = entity_a._solver.collider.n_contacts.to_torch(device=device)
+        force = contact_data.force.to_torch(device=device)
     contact_info = dict()
 
     if return_geom_force or return_geom_pos:
-        geom_a = contact_data.geom_a.to_torch(device=device)
-        geom_b = contact_data.geom_b.to_torch(device=device)
+        if data_cache is not None:
+            geom_a = data_cache.geom_a
+            geom_b = data_cache.geom_b
+        else:
+            geom_a = contact_data.geom_a.to_torch(device=device)
+            geom_b = contact_data.geom_b.to_torch(device=device)
         if geom_filter is None:
             geom_a_idxs = (
                 torch.arange(entity_a.geom_start, entity_a.geom_end, device=force.device)
@@ -440,8 +511,12 @@ def get_filtered_contacts(
         geom_filter.prepare(n_contacts, geom_a, geom_b)
 
     if return_link_force or return_link_pos:
-        link_a = contact_data.link_a.to_torch(device=device)
-        link_b = contact_data.link_b.to_torch(device=device)
+        if data_cache is not None:
+            link_a = data_cache.link_a
+            link_b = data_cache.link_b
+        else:
+            link_a = contact_data.link_a.to_torch(device=device)
+            link_b = contact_data.link_b.to_torch(device=device)
         if link_filter is None:
             link_a_idxs = (
                 torch.arange(entity_a.link_start, entity_a.link_end, device=force.device)
@@ -469,7 +544,10 @@ def get_filtered_contacts(
         )
 
     if return_geom_pos or return_link_pos:
-        contact_pos = contact_data.pos.to_torch(device=device)
+        if data_cache is not None:
+            contact_pos = data_cache.pos
+        else:
+            contact_pos = contact_data.pos.to_torch(device=device)
     if return_geom_pos:
         geom_pos, geom_valid = geom_filter.all_positions(
             contact_pos, out=geom_pos_out, valid_out=geom_pos_valid_out

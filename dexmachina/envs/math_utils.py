@@ -86,3 +86,34 @@ def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
     )
     return o.reshape(quaternions.shape[:-1] + (3, 3))
 
+
+def closest_vertex_distances_object_frame(
+    local_vertices: torch.Tensor,
+    keypoint_pos: torch.Tensor,
+    pose: torch.Tensor,
+    *,
+    env_chunk_size: int = 256,
+) -> torch.Tensor:
+    """Find each world-frame keypoint's distance to static local vertices.
+
+    ``pose`` maps the local vertices into the world frame. Rigid transforms
+    preserve distances, so only the keypoints are transformed by the inverse
+    pose. Distances are reduced in environment chunks, avoiding a full
+    ``(N, K, V)`` distance tensor.
+    """
+    if env_chunk_size <= 0:
+        raise ValueError("env_chunk_size must be positive")
+
+    rotation = matrix_from_quat(pose[:, 3:7])
+    centered_keypoints = keypoint_pos - pose[:, None, :3]
+    local_keypoints = torch.einsum(
+        "nji,nkj->nki", rotation, centered_keypoints
+    )
+
+    min_distances = torch.empty_like(local_keypoints[..., 0])
+    for start in range(0, local_keypoints.shape[0], env_chunk_size):
+        stop = min(start + env_chunk_size, local_keypoints.shape[0])
+        min_distances[start:stop] = torch.cdist(
+            local_keypoints[start:stop], local_vertices, p=2
+        ).min(dim=-1).values
+    return min_distances

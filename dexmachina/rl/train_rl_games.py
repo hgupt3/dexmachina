@@ -1,5 +1,4 @@
 import os 
-import json
 import math
 import yaml
 import torch  
@@ -20,74 +19,8 @@ from dexmachina.envs.constructors import get_common_argparser, get_all_env_cfg, 
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
 
 
-CAPTURE_WINDOW_SECONDS = 30.0
 CAPTURE_MAX_START_DELAY_SECONDS = 15.0
 CAPTURE_PUBLISHER_SHUTDOWN_GRACE_SECONDS = 120.0
-
-
-def _round_to_multiple(value, multiple):
-    return max(multiple, ((value + multiple // 2) // multiple) * multiple)
-
-
-def _default_capture_schedule(window_steps, horizon_length):
-    window_epochs = math.ceil(window_steps / horizon_length)
-    return [
-        {
-            "every_epochs": _round_to_multiple(2 * window_epochs, 25),
-            "through_epoch": 2000,
-        },
-        {
-            "every_epochs": _round_to_multiple(6 * window_epochs, 50),
-            "through_epoch": None,
-        },
-    ]
-
-
-def _parse_capture_schedule(raw):
-    try:
-        schedule = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ValueError("--capture-schedule must be valid JSON") from error
-    if not isinstance(schedule, list) or not schedule:
-        raise ValueError("--capture-schedule must be a nonempty JSON list")
-    previous_through = None
-    for index, entry in enumerate(schedule):
-        if not isinstance(entry, dict) or set(entry) != {
-            "every_epochs",
-            "through_epoch",
-        }:
-            raise ValueError(
-                "capture schedule entries require exactly every_epochs and "
-                "through_epoch"
-            )
-        every_epochs = entry["every_epochs"]
-        if (
-            isinstance(every_epochs, bool)
-            or not isinstance(every_epochs, int)
-            or every_epochs < 1
-        ):
-            raise ValueError("capture schedule every_epochs must be at least one")
-        through_epoch = entry["through_epoch"]
-        if through_epoch is None:
-            if index != len(schedule) - 1:
-                raise ValueError(
-                    "only the last capture schedule entry may be open-ended"
-                )
-            continue
-        if (
-            isinstance(through_epoch, bool)
-            or not isinstance(through_epoch, int)
-            or through_epoch < 1
-        ):
-            raise ValueError(
-                "capture schedule through_epoch must be a positive integer or null"
-            )
-        if previous_through is not None and through_epoch <= previous_through:
-            raise ValueError(
-                "capture schedule through_epoch values must be strictly increasing"
-            )
-        previous_through = through_epoch
-    return schedule
 
 
 class CaptureIsaacAlgoObserver(IsaacAlgoObserver):
@@ -142,28 +75,20 @@ def main():
     parser.add_argument("--checkpoint", '-ck', type=str, default=None, help="Checkpoint file to load.")
     parser.add_argument("--learning_rate", "-lr", type=float, default=0.0003, help="Learning rate for the agent.") 
     parser.add_argument("--wandb_project", "-wp", type=str, default="dexmachina", help="WandB project name.")
-    parser.add_argument("--save_freq", "-sf", type=int, default=1000)
     parser.add_argument("--action_bench_experiment", type=str, default=None)
     parser.add_argument("--action_bench_catalog", type=str, default=None)
     parser.add_argument("--state-capture-dir", type=str, default=None)
-    parser.add_argument("--capture-every", type=int, default=None)
-    parser.add_argument("--capture-schedule", type=str, default=None)
+    parser.add_argument("--capture-every-minutes", type=float, default=None)
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--wandb_run_id", type=str, default=None)
     args = parser.parse_args()
 
-    if args.capture_every is not None and args.capture_every < 1:
-        raise ValueError("--capture-every must be at least one")
-    if args.capture_every is not None and args.capture_schedule is not None:
-        raise ValueError(
-            "--capture-every and --capture-schedule are mutually exclusive"
-        )
-    capture_schedule_override = (
-        None
-        if args.capture_schedule is None
-        else _parse_capture_schedule(args.capture_schedule)
-    )
+    if args.capture_every_minutes is not None and (
+        not math.isfinite(args.capture_every_minutes)
+        or args.capture_every_minutes <= 0.0
+    ):
+        raise ValueError("--capture-every-minutes must be finite and positive")
     if args.horizon < 1:
         raise ValueError("--horizon must be at least one")
     if args.wandb_run_id is not None and (
@@ -238,22 +163,22 @@ def main():
     agent_cfg["params"]["config"]["train_dir"] = log_root_path
     agent_cfg["params"]["config"]["full_experiment_name"] = exp_name
     agent_cfg["params"]["config"]["max_epochs"] = int(args.max_epochs)
-    agent_cfg["params"]["config"]["save_frequency"] = int(args.save_freq)
     agent_cfg["params"]["config"]["horizon_length"] = int(args.horizon)
 
     capture_schedule = None
+    capture_window_seconds = None
     capture_requested = args.state_capture_dir is not None and not args.no_capture
     if capture_requested:
+        from action_bench.recording import (
+            DEFAULT_CAPTURE_WINDOW_SECONDS,
+            make_capture_schedule,
+        )
+
         horizon_length = int(agent_cfg["params"]["config"]["horizon_length"])
-        window_steps = math.ceil(CAPTURE_WINDOW_SECONDS / float(raw_env.dt))
-        capture_schedule = (
-            capture_schedule_override
-            if capture_schedule_override is not None
-            else (
-                [{"every_epochs": args.capture_every, "through_epoch": None}]
-                if args.capture_every is not None
-                else _default_capture_schedule(window_steps, horizon_length)
-            )
+        capture_window_seconds = DEFAULT_CAPTURE_WINDOW_SECONDS
+        window_steps = math.ceil(capture_window_seconds / float(raw_env.dt))
+        capture_schedule = make_capture_schedule(
+            every_minutes=args.capture_every_minutes,
         )
         print(
             "[INFO] State capture schedule "
@@ -356,7 +281,7 @@ def main():
             output_root=args.state_capture_dir,
             wandb_project=args.wandb_project,
             wandb_run_id=run.id,
-            window_seconds=CAPTURE_WINDOW_SECONDS,
+            window_seconds=capture_window_seconds,
             max_start_delay_seconds=CAPTURE_MAX_START_DELAY_SECONDS,
             on_complete=(
                 None if capture_publisher is None else capture_publisher.enqueue

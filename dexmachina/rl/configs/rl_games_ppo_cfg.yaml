@@ -66,7 +66,6 @@ params:
     score_to_win: 100000
     max_epochs: 1000
     save_best_after: 10
-    save_frequency: 1500
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.0
@@ -154,7 +153,6 @@ params:
     score_to_win: 100000
     max_epochs: 1000
     save_best_after: 10
-    save_frequency: 1500
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.0
@@ -241,7 +239,6 @@ params:
     score_to_win: 100000
     max_epochs: 1000
     save_best_after: 10
-    save_frequency: 1500
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.0
@@ -259,6 +256,5 @@ params:
       deterministic: True
       games_num: 100000
       print_stats: True
-
 
 

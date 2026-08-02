@@ -5,8 +5,11 @@ import genesis as gs
 from dexmachina.envs.robot import BaseRobot
 from dexmachina.envs.object import ArticulatedObject
 from dexmachina.envs.rewards import RewardModule
-from dexmachina.envs.math_utils import matrix_from_quat
-from dexmachina.envs.contacts import ContactIndexFilter, get_filtered_contacts
+from dexmachina.envs.math_utils import (
+    closest_vertex_distances_object_frame,
+    matrix_from_quat,
+)
+from dexmachina.envs.contacts import ContactDataCache, ContactIndexFilter, get_filtered_contacts
 from dexmachina.envs.randomizations import RandomizationModule
 from dexmachina.envs.curriculum import Curriculum 
 from dexmachina.envs.maniptrans_curr import ManipTransCurriculum 
@@ -372,7 +375,10 @@ class BaseEnv:
             # load vertices
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
-            self.obj_verts = {part: obj.sample_mesh_vertices(300, part) for part in ['top', 'bottom']}
+            self.obj_verts = {
+                part: obj.sample_mesh_vertices(300, part).to(self.device)
+                for part in ['top', 'bottom']
+            }
         
         self.observe_contact_force = env_cfg.get('observe_contact_force', False)
         if self.n_objects == 0:
@@ -391,6 +397,8 @@ class BaseEnv:
             self.contact_link_filter = ContactIndexFilter(
                 self.filter_links_a, self.filter_links_b
             )
+            # Built lazily on first query: the collider exists only post-build.
+            self.contact_data_cache = None
             self.num_left_contact_links = len(self.robots['left'].coll_idxs_global)
 
             print("num_obj_links", self.num_obj_links) 
@@ -821,6 +829,14 @@ class BaseEnv:
 
         if self.observe_contact_force or self.use_contact_reward:
             entity_a = self.object.entity
+            if self.contact_data_cache is None:
+                self.contact_data_cache = ContactDataCache(
+                    entity_a._solver.collider,
+                    self.device,
+                    need_geom_ids=False,
+                    need_link_ids=True,
+                    need_pos=self.use_contact_reward,
+                )
             get_filtered_contacts(
                     entity_a=entity_a, 
                     entity_b=None,
@@ -837,6 +853,7 @@ class BaseEnv:
                         self.contact_link_valid if self.use_contact_reward else None
                     ),
                     device=self.device ,
+                    data_cache=self.contact_data_cache,
                 )
             if self.observe_contact_force:
                 torch.norm(
@@ -1018,12 +1035,8 @@ class BaseEnv:
         return transformed
         
     def compute_closest_vertice_dist_single(self, verts, keypoint_pos, pose):
-        # verts: (N, K, 3), keypoint_pos: (N, 3), pose: (N, 7)
-        verts = verts.unsqueeze(0).repeat((keypoint_pos.shape[0], 1, 1)).to(pose.device)
-        verts = self.transform_vertice_frame(verts, pose)
-        dists = torch.cdist(keypoint_pos, verts, p=2)
-        min_dists = torch.min(dists, dim=-1).values
-        return min_dists
+        # verts: (V, 3), keypoint_pos: (N, K, 3), pose: (N, 7)
+        return closest_vertex_distances_object_frame(verts, keypoint_pos, pose)
         
     def _add_camera(self, camera_kwargs):
         ''' Set camera position and direction, NOTE this must be done BEFORE scene.build()''' 

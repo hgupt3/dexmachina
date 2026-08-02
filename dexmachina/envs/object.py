@@ -327,7 +327,6 @@ class ArticulatedObject:
         self.dof_pos = torch.zeros((self.num_envs, self.num_joints), dtype=torch.float32, device=self.device)
         self.dof_vel = torch.zeros((self.num_envs, self.num_joints), dtype=torch.float32, device=self.device)
         
-        self.contact_force = torch.zeros((self.num_envs, self.n_links, 3), dtype=torch.float32, device=self.device)
         self.state_diff = torch.zeros((self.num_envs, 8), dtype=torch.float32, device=self.device)
 
     def update_value_buffers(self):
@@ -344,7 +343,6 @@ class ArticulatedObject:
 
         self.dof_pos[:] = entity.get_dofs_position(self.dof_idxs)
         self.dof_vel[:] = entity.get_dofs_velocity(self.dof_idxs)
-        self.contact_force[:] = entity.get_links_net_contact_force()
         if self.demo_states is not None:
             demo_goal_t = torch.where(
                 self.episode_length_buf >= self.num_demo_frames - 1, self.num_demo_frames - 1, self.episode_length_buf + 1)
@@ -450,7 +448,6 @@ class ArticulatedObject:
         self.part_pos[env_idxs, :, :] = 0.0
         self.part_quat[env_idxs, :, :] = 0.0
 
-        self.contact_force[env_idxs, :] = 0.0
         self.episode_length_buf[env_idxs] = 0
         if episode_start is not None:
             self.episode_length_buf[env_idxs] = episode_start
