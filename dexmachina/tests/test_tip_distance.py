@@ -66,3 +66,22 @@ def test_object_frame_tip_distance_shape_and_keypoint_order_are_exact():
         actual,
         torch.tensor([[0.0, 1.0, 1.0], [0.0, 3.0, 2.0]]),
     )
+
+
+def test_tip_distance_chunk_size_only_partitions_environments():
+    generator = torch.Generator().manual_seed(8403)
+    local_vertices = torch.randn(300, 3, generator=generator)
+    keypoint_pos = torch.randn(19, 31, 3, generator=generator)
+    pose = torch.randn(19, 7, generator=generator)
+    pose[:, 3:] /= torch.linalg.vector_norm(
+        pose[:, 3:], dim=-1, keepdim=True
+    )
+
+    one_environment_at_a_time = closest_vertex_distances_object_frame(
+        local_vertices, keypoint_pos, pose, env_chunk_size=1
+    )
+    one_chunk = closest_vertex_distances_object_frame(
+        local_vertices, keypoint_pos, pose, env_chunk_size=keypoint_pos.shape[0]
+    )
+
+    assert torch.equal(one_environment_at_a_time, one_chunk)

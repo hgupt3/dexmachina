@@ -102,6 +102,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     env_cfg['num_envs'] = num_envs
     env_cfg['early_reset_threshold'] = args.early_reset_threshold
     env_cfg['early_reset_interval'] = args.early_reset_interval
+    env_cfg['termination_penalty'] = args.termination_penalty
     env_cfg['early_reset_aux_thres'] = dict(con=args.aux_reset_thres[0], imi=args.aux_reset_thres[1], bc=args.aux_reset_thres[2])
     env_cfg['episode_length'] = ep_len
     env_cfg['observe_tip_dist'] = args.observe_tip_dist
@@ -261,6 +262,7 @@ def get_common_argparser():
     parser.add_argument('--last_n_frame', type=int, default=-1)
     parser.add_argument('--early_reset_threshold', '-ert', type=float, default=0.5)
     parser.add_argument('--early_reset_interval', '-eri', type=int, default=5)
+    parser.add_argument('--termination_penalty', '-tpen', type=float, default=0.0)
     parser.add_argument('--aux_reset_thres', type=float, nargs='+', default=[0, 0, 0])
     parser.add_argument('--record_video', '-rv', action='store_true')
     parser.add_argument('--render_camera', '-rcam', type=str, default='front')

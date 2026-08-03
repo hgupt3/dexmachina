@@ -130,6 +130,7 @@ def get_env_cfg(
         "dt": dt,
         "early_reset_threshold": 0.0,
         "early_reset_interval": 5,
+        "termination_penalty": 0.0,
         "early_reset_aux_thres": dict(con=0, imi=0, bc=0),
         "record_video": False,
         "render_segmentation": False,
@@ -194,6 +195,7 @@ class BaseEnv:
         self.dt = env_cfg['dt'] 
         self.early_reset_threshold = env_cfg['early_reset_threshold']
         self.early_reset_interval = int(env_cfg['early_reset_interval']) 
+        self.termination_penalty = float(env_cfg.get('termination_penalty', 0.0))
         self.early_reset_aux_thres = env_cfg.get('early_reset_aux_thres', dict())
         # if true, return obs dict insteaf of obs
         self.use_rl_games = env_cfg['use_rl_games']
@@ -633,6 +635,11 @@ class BaseEnv:
         self.reset_buf[:] = self.reset_terminated | self.reset_time_outs
  
         rew_dict = self._get_rewards()
+        if self.termination_penalty > 0.0:
+            # True terminations only (fell/culled); timeouts are truncations
+            # and stay bootstrapped. The task-reward culling accumulator is
+            # unaffected: it tracks task_rew, not rew_buf.
+            self.rew_buf[self.reset_terminated & ~self.reset_time_outs] -= self.termination_penalty
         if "log" not in self.extras:
             self.extras["log"] = dict() 
 
@@ -691,7 +698,11 @@ class BaseEnv:
             obj_pos, obj_quat, obj_arti = obj.root_pos, obj.root_quat, obj.dof_pos
         else:
             obj_pos, obj_quat, obj_arti = None, None, None
-        bc_dist = torch.cat([robot.get_bc_dist() for robot in self.robots.values()], dim=-1)
+        bc_dist = None
+        if self.reward_module.bc_rew_weight > 0.0:
+            bc_dist = torch.cat(
+                [robot.get_bc_dist() for robot in self.robots.values()], dim=-1
+            )
         reward_kwargs = dict(
             actions=self.actions,
             bc_dist=bc_dist,

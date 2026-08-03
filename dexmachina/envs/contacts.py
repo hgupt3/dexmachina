@@ -161,6 +161,10 @@ class ContactIndexFilter:
 
         self._pair_shape = None
         self._float_dtype = None
+        self._contact_norm_shape = None
+        self._contact_norm_dtype = None
+        self._reduction_shape = None
+        self._reduction_dtype = None
         self._prepared = False
 
     def _ensure_pair_workspace(self, pair_a, pair_b):
@@ -216,9 +220,6 @@ class ContactIndexFilter:
         self._combined_scalar_source = torch.empty(
             (*self._pair_shape, 2), dtype=dtype, device=self.device
         )
-        self._contact_norm = torch.empty(
-            self._pair_shape, dtype=dtype, device=self.device
-        )
         n_envs = self._pair_shape[1]
         self._force_sums = torch.empty(
             (n_envs, self.n_a, self.n_b), dtype=dtype, device=self.device
@@ -230,9 +231,146 @@ class ContactIndexFilter:
 
     def contact_force_norm(self, force):
         """Compute force norms into a reusable pair-sized buffer."""
-        self._ensure_float_workspace(force.dtype)
+        shape = tuple(force.shape[:2])
+        if (
+            self._contact_norm_shape != shape
+            or self._contact_norm_dtype != force.dtype
+        ):
+            self._contact_norm = torch.empty(
+                shape, dtype=force.dtype, device=self.device
+            )
+            self._contact_norm_shape = shape
+            self._contact_norm_dtype = force.dtype
         torch.linalg.vector_norm(force, dim=-1, out=self._contact_norm)
         return self._contact_norm
+
+    def reduce_contacts(
+        self,
+        n_contacts,
+        pair_a,
+        pair_b,
+        force,
+        contact_pos=None,
+        *,
+        return_force=True,
+        force_out=None,
+        pos_out=None,
+        valid_out=None,
+    ):
+        """Fuse force and force-weighted-position reductions when possible.
+
+        The CUDA path scans Genesis contact slots once per environment and
+        output bin.  It replaces index-lookup workspaces and three atomic
+        scatters.  CPU and non-fp32 calls use the original indexed operations,
+        which also provides a portable reference path for contract tests.
+        """
+        if pair_a.shape != pair_b.shape or pair_a.ndim != 2:
+            raise ValueError("pair_a and pair_b should have matching 2D shapes")
+        if n_contacts.shape != (pair_a.shape[1],):
+            raise ValueError("n_contacts should have shape (num_envs,)")
+        if force.shape != (*pair_a.shape, 3):
+            raise ValueError("force should have shape (*pair_a.shape, 3)")
+        if any(tensor.device != self.device for tensor in (pair_a, pair_b, force)):
+            raise ValueError("contact inputs and filter indices should share a device")
+        return_pos = contact_pos is not None
+        if not return_force and not return_pos:
+            raise ValueError("at least one contact reduction should be requested")
+        if return_pos and (
+            contact_pos.shape != force.shape or contact_pos.device != self.device
+        ):
+            raise ValueError("contact_pos should match force shape and device")
+
+        n_envs = pair_a.shape[1]
+        force_shape = (n_envs, self.n_a, self.n_b, 3)
+        valid_shape = force_shape[:-1]
+        if return_force:
+            force_out = self._check_output(force_out, force_shape, force.dtype)
+        if return_pos:
+            pos_out = self._check_output(pos_out, force_shape, contact_pos.dtype)
+            valid_out = self._check_output(valid_out, valid_shape, torch.bool)
+
+        if self.n_a == 0 or self.n_b == 0:
+            if return_force:
+                force_out.zero_()
+            if return_pos:
+                pos_out.zero_()
+                valid_out.zero_()
+            return force_out, pos_out, valid_out
+
+        # Keep the force-only path on the established indexed scatter.  The
+        # fused kernel is for the aux-reward workload, where grouped positions
+        # let one ordered pass replace all three scatters.
+        use_cuda_kernel = (
+            return_pos
+            and self.device.type == "cuda"
+            and force.dtype == torch.float32
+            and (not return_pos or contact_pos.dtype == torch.float32)
+            and pair_a.is_contiguous()
+            and pair_b.is_contiguous()
+            and force.is_contiguous()
+            and n_contacts.is_contiguous()
+            and (not return_pos or contact_pos.is_contiguous())
+            and (not return_force or force_out.is_contiguous())
+            and (not return_pos or pos_out.is_contiguous())
+            and (not return_pos or valid_out.is_contiguous())
+            and self.n_a * self.n_b <= 1024
+        )
+        if use_cuda_kernel:
+            from dexmachina.envs import contact_kernels
+
+            use_cuda_kernel = contact_kernels.is_available()
+
+        if use_cuda_kernel:
+            force_norm = (
+                self.contact_force_norm(force) if return_pos else force
+            )
+            if return_pos and (
+                self._reduction_shape != valid_shape
+                or self._reduction_dtype != force.dtype
+            ):
+                self._force_sums = torch.empty(
+                    valid_shape, dtype=force.dtype, device=self.device
+                )
+                self._invalid_sums = torch.empty(
+                    valid_shape, dtype=torch.bool, device=self.device
+                )
+                self._reduction_shape = valid_shape
+                self._reduction_dtype = force.dtype
+            contact_kernels.indexed_contact_reduce(
+                n_contacts,
+                pair_a,
+                pair_b,
+                force,
+                contact_pos if return_pos else force,
+                force_norm,
+                self.a_idxs,
+                self.b_idxs,
+                force_out if return_force else force,
+                pos_out if return_pos else force,
+                self._force_sums if return_pos else force,
+                return_force=return_force,
+                return_pos=return_pos,
+            )
+            if return_pos:
+                torch.gt(self._force_sums, 0, out=valid_out)
+                torch.logical_not(valid_out, out=self._invalid_sums)
+                self._force_sums.masked_fill_(self._invalid_sums, 1)
+                pos_out.div_(self._force_sums.unsqueeze(-1))
+                pos_out.masked_fill_(self._invalid_sums.unsqueeze(-1), 0)
+            return force_out, pos_out, valid_out
+
+        self.prepare(n_contacts, pair_a, pair_b)
+        if return_force:
+            self.sum_forces(force, out=force_out)
+        if return_pos:
+            force_norm = self.contact_force_norm(force)
+            self.group_positions(
+                contact_pos,
+                force_norm,
+                out=pos_out,
+                valid_out=valid_out,
+            )
+        return force_out, pos_out, valid_out
 
     def prepare(self, n_contacts, pair_a, pair_b):
         """Gather local indices and validity for direct and flipped pairs."""
@@ -532,17 +670,10 @@ def get_filtered_contacts(
             else:
                 link_b_idxs = torch.as_tensor(filter_links_b, device=force.device)
             link_filter = ContactIndexFilter(link_a_idxs, link_b_idxs)
-        link_filter.prepare(n_contacts, link_a, link_b)
-
     if return_geom_force:
         contact_info['contact_force_geom_a'] = geom_filter.sum_forces(
             force, out=geom_force_out
         )
-    if return_link_force:
-        contact_info['contact_force_link_a'] = link_filter.sum_forces(
-            force, out=link_force_out
-        )
-
     if return_geom_pos or return_link_pos:
         if data_cache is not None:
             contact_pos = data_cache.pos
@@ -554,16 +685,23 @@ def get_filtered_contacts(
         )
         contact_info['contact_pos_geom_a'] = geom_pos
         contact_info['contact_pos_geom_a_valid'] = geom_valid
-    if return_link_pos:
-        force_norm = link_filter.contact_force_norm(force)
-        link_pos, link_valid = link_filter.group_positions(
-            contact_pos,
-            force_norm,
-            out=link_pos_out,
+    if return_link_force or return_link_pos:
+        link_force, link_pos, link_valid = link_filter.reduce_contacts(
+            n_contacts,
+            link_a,
+            link_b,
+            force,
+            contact_pos=contact_pos if return_link_pos else None,
+            return_force=return_link_force,
+            force_out=link_force_out,
+            pos_out=link_pos_out,
             valid_out=link_pos_valid_out,
         )
-        contact_info['contact_pos_link_a'] = link_pos
-        contact_info['contact_pos_link_a_valid'] = link_valid
+        if return_link_force:
+            contact_info['contact_force_link_a'] = link_force
+        if return_link_pos:
+            contact_info['contact_pos_link_a'] = link_pos
+            contact_info['contact_pos_link_a_valid'] = link_valid
 
     return contact_info
 

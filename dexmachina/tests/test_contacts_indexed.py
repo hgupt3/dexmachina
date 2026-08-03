@@ -146,11 +146,25 @@ def test_index_filter_is_exactly_equal_to_original(case_name):
     )
     actual_all, actual_all_valid = contact_filter.all_positions(contact_pos)
 
+    fused_filter = ContactIndexFilter(a_idxs, b_idxs)
+    fused_force, fused_grouped, fused_grouped_valid = (
+        fused_filter.reduce_contacts(
+            n_contacts,
+            pair_a,
+            pair_b,
+            force,
+            contact_pos=contact_pos,
+        )
+    )
+
     assert torch.equal(actual_force, expected_force)
     assert torch.equal(actual_grouped, expected_grouped)
     assert torch.equal(actual_grouped_valid, expected_grouped_valid)
     assert torch.equal(actual_all, expected_all)
     assert torch.equal(actual_all_valid, expected_all_valid)
+    assert torch.equal(fused_force, expected_force)
+    assert torch.equal(fused_grouped, expected_grouped)
+    assert torch.equal(fused_grouped_valid, expected_grouped_valid)
 
 
 def test_filter_reuses_caller_owned_outputs_exactly():
@@ -184,6 +198,28 @@ def test_filter_reuses_caller_owned_outputs_exactly():
     assert torch.equal(force_out, _original_filter_force(force, mask))
     assert torch.equal(pos_out, expected_pos)
     assert torch.equal(valid_out, expected_valid)
+
+    fused_force_out = torch.full_like(force_out, float("nan"))
+    fused_pos_out = torch.full_like(pos_out, float("nan"))
+    fused_valid_out = torch.ones_like(valid_out)
+    fused_filter = ContactIndexFilter(a_idxs, b_idxs)
+    returned_force, returned_pos, returned_valid = fused_filter.reduce_contacts(
+        n_contacts,
+        pair_a,
+        pair_b,
+        force,
+        contact_pos=contact_pos,
+        force_out=fused_force_out,
+        pos_out=fused_pos_out,
+        valid_out=fused_valid_out,
+    )
+
+    assert returned_force is fused_force_out
+    assert returned_pos is fused_pos_out
+    assert returned_valid is fused_valid_out
+    assert torch.equal(fused_force_out, _original_filter_force(force, mask))
+    assert torch.equal(fused_pos_out, expected_pos)
+    assert torch.equal(fused_valid_out, expected_valid)
 
 
 def test_index_contact_force_compatibility_entry_point():

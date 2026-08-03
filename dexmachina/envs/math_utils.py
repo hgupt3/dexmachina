@@ -92,7 +92,7 @@ def closest_vertex_distances_object_frame(
     keypoint_pos: torch.Tensor,
     pose: torch.Tensor,
     *,
-    env_chunk_size: int = 256,
+    env_chunk_size: int = 1024,
 ) -> torch.Tensor:
     """Find each world-frame keypoint's distance to static local vertices.
 
