@@ -951,24 +951,40 @@ class BaseEnv:
         avg_rew = rewards / self.max_episode_length
         return avg_rew.mean().item()
 
+    def _curriculum_reset_statistics(self, env_idxs, progressed):
+        """Copy reset progress and enabled reward means to the host once."""
+        reward_buffers = (
+            ('task', self.cumulative_task_rew),
+            ('con', self.cumulative_con_rew),
+            ('imi', self.cumulative_imi_rew),
+            ('bc', self.cumulative_bc_rew),
+        )
+        reward_keys = []
+        statistics = [torch.mean(progressed.float())]
+        for key, rewards in reward_buffers:
+            if key in self.reward_keys:
+                reward_keys.append(key)
+                avg_rew = rewards[env_idxs] / self.max_episode_length
+                statistics.append(avg_rew.mean())
+
+        host_statistics = torch.stack(statistics).tolist()
+        return host_statistics[0], dict(zip(reward_keys, host_statistics[1:]))
+
     def reset_idx(self, env_idxs=[]):
         if len(env_idxs) == 0:
             return  
         self.randomization.on_reset_idx(env_idxs)
         progressed = self.episode_length_buf[env_idxs] - self.episode_start_buf[env_idxs]
-        progressed_avg = torch.mean(progressed.float()).item()
+        if self.use_curriculum:
+            progressed_avg, episode_rewards = self._curriculum_reset_statistics(
+                env_idxs, progressed
+            )
+        else:
+            progressed_avg = torch.mean(progressed.float()).item()
+
         self.max_achieved_length = int(self.max_achieved_length * 0.5 + progressed_avg * 0.5)
 
         if self.use_curriculum:
-            episode_rewards = dict()
-            if 'task' in self.reward_keys:
-                episode_rewards['task'] = self.normalize_episode_rew(self.cumulative_task_rew[env_idxs])
-            if 'con' in self.reward_keys:
-                episode_rewards['con'] = self.normalize_episode_rew(self.cumulative_con_rew[env_idxs])
-            if 'imi' in self.reward_keys:
-                episode_rewards['imi'] = self.normalize_episode_rew(self.cumulative_imi_rew[env_idxs])
-            if 'bc' in self.reward_keys:
-                episode_rewards['bc'] = self.normalize_episode_rew(self.cumulative_bc_rew[env_idxs])
             self.curriculum.update_progress(episode_rewards, self.max_achieved_length)
 
         if self.chunk_ep_length > 0:
