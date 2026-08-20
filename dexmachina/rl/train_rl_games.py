@@ -245,7 +245,9 @@ def main():
     os.environ.pop("WANDB_SERVICE", None)
     wandb_init_kwargs = {}
     if args.wandb_run_id is not None:
-        wandb_init_kwargs.update(id=args.wandb_run_id, resume="never")
+        # "allow": a fresh launcher-generated id starts a new run; a reused id
+        # (checkpoint resume glue) continues that run instead of erroring.
+        wandb_init_kwargs.update(id=args.wandb_run_id, resume="allow")
     run = wandb.init(
         project=args.wandb_project, 
         config=wandb_cfg,

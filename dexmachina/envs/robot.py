@@ -623,10 +623,8 @@ class BaseRobot:
         else:
             raise NotImplementedError  
         # ignore the mimic values!
-        target_dof_pos = joint_targets[:, self.joint_from_idxs] * self.joint_multipliers # shape (n_envs, ndof), 
-        target_dof_pos = torch.clamp(target_dof_pos, lower_limit, upper_limit) 
-        new_targets = self.action_moving_avg * target_dof_pos + (1 - self.action_moving_avg) * self.curr_targets 
-        new_targets = torch.clamp(new_targets, lower_limit, upper_limit)
+        target_dof_pos = joint_targets[:, self.joint_from_idxs] * self.joint_multipliers # shape (n_envs, ndof),
+        target_dof_pos = torch.clamp(target_dof_pos, lower_limit, upper_limit)
         if external_finger_targets is not None:
             assert self.action_mode == "hybrid", (
                 "external finger targets require hybrid mode so DexMachina "
@@ -641,11 +639,15 @@ class BaseRobot:
             assert external_finger_targets.dtype == self.curr_targets.dtype
             finger_lower = lower_limit[self.finger_dof_idxs]
             finger_upper = upper_limit[self.finger_dof_idxs]
-            new_targets[:, self.finger_dof_idxs] = torch.clamp(
+            # Insert BEFORE the moving average so the target EMA covers every
+            # commanded dim, external finger targets included.
+            target_dof_pos[:, self.finger_dof_idxs] = torch.clamp(
                 external_finger_targets,
                 finger_lower,
                 finger_upper,
             )
+        new_targets = self.action_moving_avg * target_dof_pos + (1 - self.action_moving_avg) * self.curr_targets
+        new_targets = torch.clamp(new_targets, lower_limit, upper_limit)
         self.prev_targets[:] = self.curr_targets
         self.curr_targets[:] = new_targets 
         return new_targets
