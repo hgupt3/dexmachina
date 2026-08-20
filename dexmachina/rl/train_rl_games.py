@@ -82,6 +82,16 @@ def main():
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--wandb_run_id", type=str, default=None)
+    parser.add_argument(
+        "--train_root",
+        type=str,
+        default=None,
+        help=(
+            "Root directory for rl_games logs and checkpoints; "
+            "logs/rl_games/<hand> is created beneath it. Defaults to the "
+            "current working directory."
+        ),
+    )
     args = parser.parse_args()
 
     if args.capture_every_minutes is not None and (
@@ -155,7 +165,8 @@ def main():
     agent_cfg["params"]["seed"] = args.seed
     agent_cfg["params"]["config"]["name"] = args.hand
     
-    log_root_path = os.path.join("logs", "rl_games", args.hand)
+    train_root = args.train_root if args.train_root is not None else os.getcwd()
+    log_root_path = os.path.join(train_root, "logs", "rl_games", args.hand)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
@@ -309,6 +320,16 @@ def main():
     try:
         runner.run(runner_args)
     finally:
+        # Best-effort rolling checkpoint on abnormal shutdown; a clean exit
+        # (or a signal-triggered exit inside the train loop) already saved,
+        # and a failed save must never mask the original exception.
+        try:
+            agent = getattr(runner, "agent", None)
+            if agent is not None and agent.save_shutdown_checkpoint():
+                print("[INFO] Saved shutdown rolling checkpoint")
+        except Exception:
+            import traceback
+            traceback.print_exc()
         try:
             if state_capture is not None:
                 state_capture.close(timeout=60.0)
