@@ -233,10 +233,16 @@ def main():
     # also save args
     wandb_cfg['clip'] = f"{obj_name}{start}-{end}-{subject_name}-u{use_clip}"
     wandb_cfg['hand'] = args.hand
+    wandb_cfg['target_ema'] = args.target_ema
     wandb_cfg['action_bench_experiment'] = args.action_bench_experiment
     wandb_cfg['action_bench_catalog'] = args.action_bench_catalog
     wandb_cfg['state_capture_publish'] = capture_requested and not args.no_publish
     
+    # A tmux server booted from a launcher that touched wandb can inherit a
+    # stale WANDB_SERVICE token pointing at the launcher's dead service
+    # socket; wandb.init then fails with WandbServiceConnectionError. Always
+    # start a fresh service in the training process.
+    os.environ.pop("WANDB_SERVICE", None)
     wandb_init_kwargs = {}
     if args.wandb_run_id is not None:
         wandb_init_kwargs.update(id=args.wandb_run_id, resume="never")

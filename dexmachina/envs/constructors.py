@@ -127,11 +127,17 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
         'left': get_default_robot_cfg(name=args.hand, side='left'),
         'right': get_default_robot_cfg(name=args.hand, side='right')
     }
-    for side in ['left', 'right']: 
+    target_ema = getattr(args, 'target_ema', None)
+    if target_ema is not None:
+        assert 0.0 < target_ema <= 1.0, f"Invalid --target_ema {target_ema}, need 0 < alpha <= 1"
+        print(f"Target EMA active: alpha={target_ema} on all commanded joint targets (wrist and fingers, both hands)")
+    for side in ['left', 'right']:
         robot_cfgs[side]['action_mode'] = args.action_mode
         robot_cfgs[side]['hybrid_scales'] = tuple(args.hybrid_scales)
         robot_cfgs[side]['res_cap'] = args.res_cap
         robot_cfgs[side]['show_keypoints'] = args.show_kpts
+        if target_ema is not None:
+            robot_cfgs[side]['action_moving_avg'] = target_ema
         if args.hide_hand:
             robot_cfgs[side]['visualization'] = False
 
@@ -257,6 +263,7 @@ def get_common_argparser():
     parser.add_argument('--show_kpts', action='store_true', help='Whether to show keypoints')
     parser.add_argument('--res_cap', action='store_true')
     parser.add_argument('--hybrid_scales', type=float, nargs='+', default=[0.04, 0.5])
+    parser.add_argument('--target_ema', type=float, default=None, help='EMA alpha on the commanded PD targets, filtered <- (1-alpha)*filtered + alpha*target, all action dims both hands; default None keeps stock behavior (targets applied raw)')
     parser.add_argument('--hide_hand', action='store_true')
 
     parser.add_argument('--last_n_frame', type=int, default=-1)
