@@ -254,6 +254,15 @@ class RlGamesVecEnvWrapper(IVecEnv):
         build_config = getattr(self.env, "representation_run_config", None)
         return {} if build_config is None else build_config()
 
+    def get_env_state(self):
+        get_state = getattr(self.unwrapped, "get_env_state", None)
+        return None if get_state is None else get_state()
+
+    def set_env_state(self, env_state):
+        set_state = getattr(self.unwrapped, "set_env_state", None)
+        if set_state is not None:
+            set_state(env_state)
+
     """
     Helper functions
     """
@@ -345,3 +354,12 @@ class RlGamesGpuEnv(IVecEnv):
     def representation_run_config(self):
         build_config = getattr(self.env, "representation_run_config", None)
         return {} if build_config is None else build_config()
+
+    def get_env_state(self):
+        get_state = getattr(self.env, "get_env_state", None)
+        return None if get_state is None else get_state()
+
+    def set_env_state(self, env_state):
+        set_state = getattr(self.env, "set_env_state", None)
+        if set_state is not None:
+            set_state(env_state)

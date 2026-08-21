@@ -347,6 +347,54 @@ class Curriculum:
         self.object.entity._solver.set_geom_sol_params(new_params)
         return 
 
+    def get_state(self):
+        """Serializable warm-resume state: everything set_curriculum evolves."""
+        return {
+            'curr_gains': dict(self.curr_gains),
+            'curr_gains_lower': dict(self.curr_gains_lower),
+            'gain_history': [
+                dict(gains=dict(entry['gains']), lower=dict(entry['lower']))
+                for entry in self.gain_history
+            ],
+            'rew_deques': {k: list(v) for k, v in self.rew_deques.items()},
+            'ep_lens': list(self.ep_lens),
+            'deque_appends': int(self.deque_appends),
+            'rew_grads': dict(self.rew_grads),
+            'num_epoch_since_last_decay': int(self.num_epoch_since_last_decay),
+            'num_epoch_since_zero': int(self.num_epoch_since_zero),
+            'low_ratio': getattr(self, 'low_ratio', None),
+            'solimp': dict(
+                d0_lower=self.d0_lower,
+                dmid_lower=self.dmid_lower,
+                tconst_lower=self.tconst_lower,
+                tconst_upper=self.tconst_upper,
+            ),
+        }
+
+    def set_state(self, state):
+        self.curr_gains = dict(state['curr_gains'])
+        self.curr_gains_lower = dict(state['curr_gains_lower'])
+        self.gain_history = [
+            dict(gains=dict(entry['gains']), lower=dict(entry['lower']))
+            for entry in state['gain_history']
+        ]
+        for key, values in state['rew_deques'].items():
+            fresh = deque(maxlen=self.deque_len)
+            fresh.extend(values)
+            self.rew_deques[key] = fresh
+        self.ep_lens = deque(state['ep_lens'], maxlen=self.deque_len)
+        self.deque_appends = int(state['deque_appends'])
+        self.rew_grads = dict(state['rew_grads'])
+        self.num_epoch_since_last_decay = int(state['num_epoch_since_last_decay'])
+        self.num_epoch_since_zero = int(state['num_epoch_since_zero'])
+        if state.get('low_ratio') is not None:
+            self.low_ratio = state['low_ratio']
+        solimp = state['solimp']
+        self.d0_lower = solimp['d0_lower']
+        self.dmid_lower = solimp['dmid_lower']
+        self.tconst_lower = solimp['tconst_lower']
+        self.tconst_upper = solimp['tconst_upper']
+
     def get_reward_grads(self):
         return self.rew_grads
 

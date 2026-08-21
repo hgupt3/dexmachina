@@ -410,7 +410,12 @@ class BaseEnv:
         self.num_obs = self.obs_dim
         self.num_privileged_obs = None
         self.num_actions = self.action_dim # need for rsl
-        self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0) 
+        self.rand_init_ratio = env_cfg.get('rand_init_ratio', 0.0)
+        # Warm world-state resume: checkpoints carry the full evolving env
+        # state (sim, curriculum, RNG) and a restore continues mid-episode.
+        self.warm_env_state = env_cfg.get('warm_env_state', True)
+        self._pending_env_state = None
+        self._warm_resume_report_pending = False
         self.initialize_value_buffers()
         
         # # NOTE! seems like scene must be built first
@@ -654,6 +659,12 @@ class BaseEnv:
             self.reset_buf[:] = self.reset_buf[:] | curriculm_reset
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if self._warm_resume_report_pending:
+            self._warm_resume_report_pending = False
+            print(
+                '[warm-resume] first post-resume step: '
+                f'{len(reset_env_ids)}/{self.num_envs} envs reset'
+            )
         if len(reset_env_ids) > 0:
             # only log cum. episode reward if that env_idx is DONE 
             rew_dict['episode_rew'] = self.cumulative_task_rew[reset_env_ids] 
@@ -1041,10 +1052,199 @@ class BaseEnv:
             self.contact_link_pos[env_idxs] = 0.0
             self.contact_link_valid[env_idxs] = False  
          
-    def reset(self): 
+    def get_env_state(self):
+        """Serializable warm-resume state for rl_games checkpoints.
+
+        Everything that evolves outside the agent: per-env sim state (robot
+        and object dof pos/vel, demo-phase indices), commanded-target
+        buffers (EMA filter / delta-accumulator state), episode and reward
+        accumulators, curriculum internals with the per-env applied
+        virtual-object gains, and the global RNG streams the curriculum
+        seeds and consumes. Tensors are stored as CPU numpy arrays.
+        """
+        if not self.warm_env_state:
+            return None
+        def to_np(value):
+            return value.detach().cpu().numpy()
+        robots = {}
+        for name, robot in self.robots.items():
+            robots[name] = {
+                'dof_pos': to_np(robot.entity.get_dofs_position()),
+                'dof_vel': to_np(robot.entity.get_dofs_velocity()),
+                'curr_targets': to_np(robot.curr_targets),
+                'prev_targets': to_np(robot.prev_targets),
+                'episode_length_buf': to_np(robot.episode_length_buf),
+            }
+        objects = {}
+        for name, obj in self.objects.items():
+            entry = {
+                'root_pos': to_np(obj.entity.get_pos()),
+                'root_quat': to_np(obj.entity.get_quat()),
+                'arti_dof_pos': to_np(obj.entity.get_dofs_position(obj.dof_idxs)),
+                'dof_vel': to_np(obj.entity.get_dofs_velocity()),
+                'episode_length_buf': to_np(obj.episode_length_buf),
+            }
+            if obj.actuated:
+                force_lower, force_upper = obj.entity.get_dofs_force_range()
+                entry['dofs_kp'] = to_np(obj.entity.get_dofs_kp())
+                entry['dofs_kv'] = to_np(obj.entity.get_dofs_kv())
+                entry['dofs_force_lower'] = to_np(force_lower)
+                entry['dofs_force_upper'] = to_np(force_upper)
+            objects[name] = entry
+        state = {
+            'version': 1,
+            'num_envs': self.num_envs,
+            'episode_length_buf': to_np(self.episode_length_buf),
+            'episode_start_buf': to_np(self.episode_start_buf),
+            'max_achieved_length': int(self.max_achieved_length),
+            'cumulative_task_rew': to_np(self.cumulative_task_rew),
+            'cumulative_con_rew': to_np(self.cumulative_con_rew),
+            'cumulative_imi_rew': to_np(self.cumulative_imi_rew),
+            'cumulative_bc_rew': to_np(self.cumulative_bc_rew),
+            'actions': to_np(self.actions),
+            'last_actions': to_np(self.last_actions),
+            'robots': robots,
+            'objects': objects,
+            'rng': {
+                'numpy': np.random.get_state(),
+                'torch_cpu': to_np(torch.get_rng_state()),
+                'torch_cuda': (
+                    to_np(torch.cuda.get_rng_state(self.device))
+                    if torch.cuda.is_available()
+                    else None
+                ),
+            },
+        }
+        if self.use_curriculum and isinstance(self.curriculum, Curriculum):
+            state['curriculum'] = self.curriculum.get_state()
+        return state
+
+    def set_env_state(self, env_state):
+        """Stash a warm-resume state; the next reset() applies it in place
+        of the mass reset (rl_games restores before train() calls
+        env_reset, so applying eagerly would be wiped)."""
+        if env_state is None:
+            print(
+                '[warm-resume] checkpoint carries no env state; '
+                'continuing with freshly reset envs and initial curriculum'
+            )
+            return
+        if env_state.get('version') != 1:
+            raise ValueError(
+                f"unsupported env_state version {env_state.get('version')!r}"
+            )
+        if env_state['num_envs'] != self.num_envs:
+            raise ValueError(
+                f"env_state has {env_state['num_envs']} envs, "
+                f"this env has {self.num_envs}"
+            )
+        self._pending_env_state = env_state
+
+    def _apply_env_state(self, state):
+        def to_t(value, like):
+            return torch.as_tensor(value, dtype=like.dtype, device=like.device)
+        self.episode_length_buf[:] = to_t(state['episode_length_buf'], self.episode_length_buf)
+        self.episode_start_buf[:] = to_t(state['episode_start_buf'], self.episode_start_buf)
+        self.max_achieved_length = int(state['max_achieved_length'])
+        for key in ('cumulative_task_rew', 'cumulative_con_rew',
+                    'cumulative_imi_rew', 'cumulative_bc_rew',
+                    'actions', 'last_actions'):
+            buffer = getattr(self, key)
+            buffer[:] = to_t(state[key], buffer)
+        for name, robot in self.robots.items():
+            saved = state['robots'][name]
+            dof_pos = to_t(saved['dof_pos'], robot.dof_pos)
+            dof_vel = to_t(saved['dof_vel'], robot.dof_vel)
+            robot.entity.set_dofs_position(position=dof_pos, zero_velocity=False)
+            robot.entity.set_dofs_velocity(velocity=dof_vel)
+            robot.curr_targets[:] = to_t(saved['curr_targets'], robot.curr_targets)
+            robot.prev_targets[:] = to_t(saved['prev_targets'], robot.prev_targets)
+            robot.episode_length_buf[:] = to_t(
+                saved['episode_length_buf'], robot.episode_length_buf
+            )
+            robot.update_value_buffers()
+        for name, obj in self.objects.items():
+            saved = state['objects'][name]
+            # Free base restores through set_pos/set_quat (the host's own
+            # reset path); dof-space covers the articulation and velocities.
+            obj.entity.set_pos(
+                pos=to_t(saved['root_pos'], obj.root_pos),
+                zero_velocity=False,
+            )
+            obj.entity.set_quat(
+                quat=to_t(saved['root_quat'], obj.root_quat),
+                zero_velocity=False,
+            )
+            obj.entity.set_dofs_position(
+                position=to_t(saved['arti_dof_pos'], obj.dof_pos),
+                dofs_idx_local=obj.dof_idxs,
+                zero_velocity=False,
+            )
+            obj.entity.set_dofs_velocity(
+                velocity=to_t(saved['dof_vel'], obj.dof_vel)
+            )
+            obj.episode_length_buf[:] = to_t(
+                saved['episode_length_buf'], obj.episode_length_buf
+            )
+            if obj.actuated and 'dofs_kp' in saved:
+                gain_like = obj.entity.get_dofs_kp()
+                obj.entity.set_dofs_kp(to_t(saved['dofs_kp'], gain_like))
+                obj.entity.set_dofs_kv(to_t(saved['dofs_kv'], gain_like))
+                obj.entity.set_dofs_force_range(
+                    to_t(saved['dofs_force_lower'], gain_like),
+                    to_t(saved['dofs_force_upper'], gain_like),
+                )
+            obj.update_value_buffers()
+        curriculum_summary = 'none'
+        if 'curriculum' in state and isinstance(self.curriculum, Curriculum):
+            self.curriculum.set_state(state['curriculum'])
+            curriculum_summary = (
+                f"gains={self.curriculum.curr_gains} "
+                f"lower={self.curriculum.curr_gains_lower} "
+                f"deques={[len(q) for q in self.curriculum.rew_deques.values()]} "
+                f"ep_lens={len(self.curriculum.ep_lens)} "
+                f"since_decay={self.curriculum.num_epoch_since_last_decay} "
+                f"since_zero={self.curriculum.num_epoch_since_zero}"
+            )
+        rng = state['rng']
+        np.random.set_state(rng['numpy'])
+        torch.set_rng_state(torch.as_tensor(rng['torch_cpu'], dtype=torch.uint8))
+        if rng['torch_cuda'] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(
+                torch.as_tensor(rng['torch_cuda'], dtype=torch.uint8),
+                self.device,
+            )
+        self.nan_envs[:] = False
+        self.reset_buf[:] = False
+        self.reset_terminated[:] = False
+        self.reset_time_outs[:] = False
+        self._warm_resume_report_pending = True
+        ep_len = self.episode_length_buf.float()
+        target_sums = {
+            name: float(robot.curr_targets.sum().item())
+            for name, robot in self.robots.items()
+        }
+        print(
+            '[warm-resume] restored env state: '
+            f"episode_length min/mean/max="
+            f"{int(ep_len.min())}/{ep_len.mean():.1f}/{int(ep_len.max())} "
+            f"curr_targets_sum={target_sums} "
+            f"curriculum: {curriculum_summary}"
+        )
+
+    def reset(self):
+        if self._pending_env_state is not None:
+            state = self._pending_env_state
+            self._pending_env_state = None
+            self._apply_env_state(state)
+            self._compute_intermediate_values()
+            if self.use_rl_games:
+                return self.get_observations(), dict()
+            self.obs_buf[:] = self.get_observations()
+            return self.obs_buf, None
         # reset all envs
         env_idxs = torch.arange(self.num_envs)
-        self.reset_idx(env_idxs)  
+        self.reset_idx(env_idxs)
         if self.use_rl_games:
             return self.get_observations(), dict()
         else:

@@ -110,8 +110,9 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     print(f"Setting observe_contact_force to True")
     env_cfg['use_contact_reward'] = args.contact_rew_weight > 0
     env_cfg['use_rl_games'] = args.use_rl_games
-    env_cfg['rand_init_ratio'] = args.rand_init_ratio  
+    env_cfg['rand_init_ratio'] = args.rand_init_ratio
     env_cfg['chunk_ep_length'] = args.chunk_ep_length
+    env_cfg['warm_env_state'] = getattr(args, 'warm_env_state', True)
 
     if args.record_interval > 0 or args.record_video:
         env_cfg["record_video"] = True
@@ -264,6 +265,7 @@ def get_common_argparser():
     parser.add_argument('--res_cap', action='store_true')
     parser.add_argument('--hybrid_scales', type=float, nargs='+', default=[0.04, 0.5])
     parser.add_argument('--target_ema', type=float, default=None, help='EMA alpha on the commanded PD targets, filtered <- (1-alpha)*filtered + alpha*target, all action dims both hands; default None keeps stock behavior (targets applied raw)')
+    parser.add_argument('--warm_env_state', action=argparse.BooleanOptionalAction, default=True, help='Carry the full evolving env state (sim, curriculum, RNG) in rl_games checkpoints so a resume continues mid-episode; --no-warm_env_state saves weights-only checkpoints')
     parser.add_argument('--hide_hand', action='store_true')
 
     parser.add_argument('--last_n_frame', type=int, default=-1)
