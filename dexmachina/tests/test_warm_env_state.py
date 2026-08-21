@@ -96,6 +96,7 @@ class FakeBody:
 def _fake_env():
     env = BaseEnv.__new__(BaseEnv)
     env.warm_env_state = True
+    env.is_eval = False
     env.num_envs = NUM_ENVS
     env.device = torch.device('cpu')
     env._pending_env_state = None
@@ -189,5 +190,9 @@ def test_env_state_missing_or_mismatched_is_handled():
     state['num_envs'] = NUM_ENVS + 1
     with pytest.raises(ValueError, match="envs"):
         env.set_env_state(state)
+    env.is_eval = True  # players restore checkpoints too; eval envs ignore
+    env.set_env_state(state)
+    assert env._pending_env_state is None
+    env.is_eval = False
     env.warm_env_state = False
     assert env.get_env_state() is None

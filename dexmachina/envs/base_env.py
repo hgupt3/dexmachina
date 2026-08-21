@@ -1129,6 +1129,12 @@ class BaseEnv:
                 'continuing with freshly reset envs and initial curriculum'
             )
             return
+        if self.is_eval:
+            # rl_games players also restore checkpoints; an eval env (its
+            # own env count, curriculum-free) never ingests training world
+            # state.
+            print('[warm-resume] eval env: ignoring checkpoint env state')
+            return
         if env_state.get('version') != 1:
             raise ValueError(
                 f"unsupported env_state version {env_state.get('version')!r}"
