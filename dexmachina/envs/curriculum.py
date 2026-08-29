@@ -362,6 +362,10 @@ class Curriculum:
             'rew_grads': dict(self.rew_grads),
             'num_epoch_since_last_decay': int(self.num_epoch_since_last_decay),
             'num_epoch_since_zero': int(self.num_epoch_since_zero),
+            # decay_reward_weights multiplies these by 0.95 as training
+            # matures; without carrying them a resume reverts the throttle
+            # thresholds to their config values
+            'rew_thresholds': dict(self.rew_thresholds),
             'low_ratio': getattr(self, 'low_ratio', None),
             'solimp': dict(
                 d0_lower=self.d0_lower,
@@ -387,6 +391,9 @@ class Curriculum:
         self.rew_grads = dict(state['rew_grads'])
         self.num_epoch_since_last_decay = int(state['num_epoch_since_last_decay'])
         self.num_epoch_since_zero = int(state['num_epoch_since_zero'])
+        # absent in pre-topup checkpoints (.get): keep config thresholds
+        if state.get('rew_thresholds') is not None:
+            self.rew_thresholds = dict(state['rew_thresholds'])
         if state.get('low_ratio') is not None:
             self.low_ratio = state['low_ratio']
         solimp = state['solimp']

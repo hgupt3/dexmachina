@@ -1117,6 +1117,16 @@ class BaseEnv:
         }
         if self.use_curriculum and isinstance(self.curriculum, Curriculum):
             state['curriculum'] = self.curriculum.get_state()
+        # decay_reward_weights multiplies these on the reward module as the
+        # curriculum matures; a resume that omits them reverts imitation /
+        # bc / contact shaping to config strength
+        reward_module = getattr(self, 'reward_module', None)
+        if reward_module is not None:
+            state['reward_weights'] = {
+                attr: float(getattr(reward_module, attr))
+                for attr in ('imi_rew_weight', 'bc_rew_weight', 'contact_rew_weight')
+                if hasattr(reward_module, attr)
+            }
         return state
 
     def set_env_state(self, env_state):
@@ -1201,6 +1211,12 @@ class BaseEnv:
                     to_t(saved['dofs_force_upper'], gain_like),
                 )
             obj.update_value_buffers()
+        # absent in pre-topup checkpoints (.get): keep config weights
+        reward_module = getattr(self, 'reward_module', None)
+        if reward_module is not None:
+            for attr, value in (state.get('reward_weights') or {}).items():
+                if hasattr(reward_module, attr):
+                    setattr(reward_module, attr, float(value))
         curriculum_summary = 'none'
         if 'curriculum' in state and isinstance(self.curriculum, Curriculum):
             self.curriculum.set_state(state['curriculum'])

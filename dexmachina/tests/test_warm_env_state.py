@@ -134,6 +134,17 @@ def _fake_env():
     env.curriculum.curr_gains = {k: v * 0.9 for k, v in env.curriculum.curr_gains.items()}
     env.curriculum.num_epoch_since_last_decay = 17
     env.curriculum.num_epoch_since_zero = 3
+    # matured decay state: thresholds and reward-module weights off config
+    env.curriculum.rew_thresholds = {
+        k: v * 0.95 ** 4 for k, v in env.curriculum.rew_thresholds.items()
+    }
+
+    class FakeRewardModule:
+        imi_rew_weight = 0.2 * 0.95 ** 4
+        bc_rew_weight = 0.2 * 0.95 ** 4
+        contact_rew_weight = 2.0 * 0.95 ** 4
+
+    env.reward_module = FakeRewardModule()
     return env
 
 
@@ -170,6 +181,9 @@ def test_env_state_roundtrip_is_exact():
     env.objects['box'].entity.kp.zero_()
     env.curriculum.curr_gains = {k: 0.0 for k in env.curriculum.curr_gains}
     env.curriculum.rew_deques['task'].clear()
+    env.curriculum.rew_thresholds = {k: 1.0 for k in env.curriculum.rew_thresholds}
+    env.reward_module.imi_rew_weight = 1.0
+    env.reward_module.contact_rew_weight = 1.0
     np.random.rand(5)
     torch.rand(5)
 
