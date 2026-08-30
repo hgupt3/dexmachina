@@ -670,7 +670,13 @@ class BaseEnv:
             rew_dict['episode_rew'] = self.cumulative_task_rew[reset_env_ids] 
             self.reset_idx(reset_env_ids)  # rew and obs will be resetted   
         
-        self.extras["log"].update(rew_dict) 
+        # raw per-env tensors: NaN envs are reward-patched to -1.0 and force-reset
+        # for training (see _get_rewards / _get_dones), and task_rew is consumed
+        # downstream at full (num_envs,) shape, so nothing is filtered here. The
+        # logger reduces these over finite entries only
+        # (rl_games.common.algo_observer.finite_mean) so one NaN env cannot
+        # poison the logged mean of every diagnostic.
+        self.extras["log"].update(rew_dict)
         if self.use_curriculum:
             rew_grads = self.curriculum.get_reward_grads()
             self.extras["log"].update(
