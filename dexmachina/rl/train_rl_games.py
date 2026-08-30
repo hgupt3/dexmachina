@@ -78,7 +78,7 @@ def main():
     parser.add_argument("--action_bench_experiment", type=str, default=None)
     parser.add_argument("--action_bench_catalog", type=str, default=None)
     parser.add_argument("--state-capture-dir", type=str, default=None)
-    parser.add_argument("--capture-every-minutes", type=float, default=None)
+    parser.add_argument("--capture-every-epochs", type=int, default=None)
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--wandb_run_id", type=str, default=None)
@@ -94,11 +94,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.capture_every_minutes is not None and (
-        not math.isfinite(args.capture_every_minutes)
-        or args.capture_every_minutes <= 0.0
-    ):
-        raise ValueError("--capture-every-minutes must be finite and positive")
+    if args.capture_every_epochs is not None and args.capture_every_epochs <= 0:
+        raise ValueError("--capture-every-epochs must be positive")
     if args.horizon < 1:
         raise ValueError("--horizon must be at least one")
     if args.wandb_run_id is not None and (
@@ -188,8 +185,16 @@ def main():
         horizon_length = int(agent_cfg["params"]["config"]["horizon_length"])
         capture_window_seconds = DEFAULT_CAPTURE_WINDOW_SECONDS
         window_steps = math.ceil(capture_window_seconds / float(raw_env.dt))
+        # DexMachina epoch grid (2026-09-03): identical capture epochs for
+        # every run so videos compare across arms. Grounded in the former
+        # wall-clock standard (30 min x 3 h, hourly after) at the reference
+        # throughput of jabs B12000 x ho32 on an L40S (~215 epochs/hour).
         capture_schedule = make_capture_schedule(
-            every_minutes=args.capture_every_minutes,
+            (
+                {"every_epochs": 100, "through_epoch": 600},
+                {"every_epochs": 250, "through_epoch": None},
+            ),
+            every_epochs=args.capture_every_epochs,
         )
         print(
             "[INFO] State capture schedule "
