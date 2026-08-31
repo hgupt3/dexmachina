@@ -40,9 +40,11 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['action_penalty'] = args.action_penalty
 
     if args.objdex_baseline:
-        print("Setting action mode to hybrid for objdex baseline and task rew beta to lower")
-        args.action_mode = 'hybrid' 
-        args.task_rew_betas = [30, 2, 10]
+        # objdex-balanced: hybrid action mode forced; task_rew_betas flow
+        # from the CLI (upstream hardcoded [30, 2, 10] here and then the
+        # reward module overrode to (1, 20, 5) — both removed 2026-09-04).
+        print("Setting action mode to hybrid for objdex baseline")
+        args.action_mode = 'hybrid'
     
     task_betas = args.task_rew_betas
     assert len(task_betas) == 3, "Task reward betas should be of length 3"

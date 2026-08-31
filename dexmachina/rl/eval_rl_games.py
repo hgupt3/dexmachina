@@ -39,7 +39,15 @@ def gather_object_state_tensor(demo_data):
     arr = np.concatenate([obj_pos, obj_quat, obj_arti], axis=1)
     return torch.tensor(arr).float()
 
-def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video=False, show_reference=False):
+def eval_one_episode(
+    env,
+    agent,
+    obj_state_tensor,
+    print_rew=False,
+    record_video=False,
+    show_reference=False,
+    policy_env_idxs=None,
+):
     obs = env.reset() 
     if isinstance(obs, dict):
         obs = obs["obs"]
@@ -60,10 +68,9 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
     obj = None
     if len(uenv.objects) > 0:
         obj = uenv.objects[uenv.object_names[0]]
-        if obj.actuated:
-            print("Setting eval time obj gains to 0.0")
-            obj.set_joint_gains(0.0, 0.0, force_range=0.0)
     assert obj is not None, "No object found in the environment"
+    if policy_env_idxs is None:
+        policy_env_idxs = slice(None)
     left_hand = uenv.robots["left"]
     right_hand = uenv.robots["right"]
     joint_target_left = left_hand.residual_qpos
@@ -79,9 +86,9 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                     
             if show_reference: # visualize the demo traj and set zero action
                 obj.set_object_state(
-                    root_pos=state[:, :3][None],
-                    root_quat=state[:, 3:7][None],
-                    joint_qpos=state[:, 7][None],
+                    root_pos=demo_state[None, :3],
+                    root_quat=demo_state[None, 3:7],
+                    joint_qpos=demo_state[None, 7:8],
                     env_idxs=torch.tensor([1], dtype=torch.int32, device=device),
                 )
                 actions[-1, :] = -1.0 
@@ -94,12 +101,19 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
             obj_pos, obj_quat, obj_arti = obj.root_pos, obj.root_quat, obj.dof_pos
             # print(f"Step {env_step}: Obj pos: {obj_pos.cpu().numpy()}")
             obj_state = torch.cat([obj_pos, obj_quat, obj_arti], dim=-1)
-            eval_data["obj_state"].append(obj_state.cpu().numpy())
+            eval_data["obj_state"].append(obj_state[policy_env_idxs].cpu().numpy())
             eval_data["demo_state"].append(demo_state.cpu().numpy())
 
             rew_dict = uenv.rew_dict
             for key in ['pos_dist', 'rot_dist', 'arti_dist']:
-                eval_data[key].append(rew_dict[key].cpu().numpy())
+                eval_data[key].append(rew_dict[key][policy_env_idxs].cpu().numpy())
+            eval_data["task_rew"].append(
+                rew_dict["task_rew"][policy_env_idxs].cpu().numpy()
+            )
+            eval_data["reward"].append(rew[policy_env_idxs].cpu().numpy())
+            eval_data["object_dropped"].append(
+                (obj.root_pos[policy_env_idxs, 2] < uenv.table_height).cpu().numpy()
+            )
             if len(dones) > 0:
                 # reset rnn state for terminated episodes
                 if agent.is_rnn and agent.states is not None:
@@ -118,6 +132,41 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
     return frames, eval_data
 
 
+def set_and_verify_eval_object_gains(env, gains):
+    kp, kv, force_range = gains
+    assert not env.use_curriculum, "Fixed eval object gains require curriculum to be disabled"
+    assert len(env.objects) > 0, "No object found in the environment"
+
+    for name, obj in env.objects.items():
+        assert obj.actuated, f"Object {name} was not built as actuated"
+        obj.set_joint_gains(kp, kv, force_range=force_range)
+
+        dof_idxs = list(range(7))
+        actual_kp = obj.entity.get_dofs_kp(dof_idxs)
+        actual_kv = obj.entity.get_dofs_kv(dof_idxs)
+        actual_lower, actual_upper = obj.entity.get_dofs_force_range(dof_idxs)
+        expected_kp = torch.full_like(actual_kp, kp)
+        expected_kv = torch.full_like(actual_kv, kv)
+        expected_lower = torch.full_like(actual_lower, -force_range)
+        expected_upper = torch.full_like(actual_upper, force_range)
+        assert torch.allclose(actual_kp, expected_kp)
+        assert torch.allclose(actual_kv, expected_kv)
+        assert torch.allclose(actual_lower, expected_lower)
+        assert torch.allclose(actual_upper, expected_upper)
+
+        print(f"Object {name!r} DOF kp after setting: {actual_kp[0].cpu().tolist()}")
+        print(f"Object {name!r} DOF kv after setting: {actual_kv[0].cpu().tolist()}")
+        print(
+            f"Object {name!r} DOF force range after setting: "
+            f"lower={actual_lower[0].cpu().tolist()}, "
+            f"upper={actual_upper[0].cpu().tolist()}"
+        )
+        print(
+            f"Verified fixed gains across {actual_kp.shape[0]} envs and "
+            f"{actual_kp.shape[1]} object DOFs"
+        )
+
+
 def main():
 
     parser = get_common_argparser()
@@ -130,6 +179,14 @@ def main():
     parser.add_argument('--video_fname', '-of', type=str, default="-eval.mp4") # if not provided, save in the same folder as the checkpoint
     parser.add_argument("--action_bench_experiment", type=str, default=None)
     parser.add_argument("--action_bench_catalog", type=str, default=None)
+    parser.add_argument("--eval_dir", type=str, default=None)
+    parser.add_argument(
+        "--eval_object_gains",
+        type=float,
+        nargs=3,
+        metavar=("KP", "KV", "FORCE_RANGE"),
+        default=None,
+    )
     
     args = parser.parse_args()
 
@@ -149,7 +206,9 @@ def main():
     
     ckpt_name = f"{args.checkpoint.split('/')[-1]}" # inpsire_ep1000 etc
     run_name = f"{args.checkpoint.split('/')[-3]}" # inpsire_ep1000 etc
-    ckpt_data_folder = os.path.join(ckpt_path, ckpt_name.replace(".pth", "_eval"))
+    ckpt_data_folder = args.eval_dir
+    if ckpt_data_folder is None:
+        ckpt_data_folder = os.path.join(ckpt_path, ckpt_name.replace(".pth", "_eval"))
     os.makedirs(ckpt_data_folder, exist_ok=True) 
 
     video_fname = join(ckpt_data_folder, f"video.mp4")
@@ -204,19 +263,40 @@ def main():
             lookat=(0.0, -1.58, 2.0),
         ) 
     for name, cfg in env_kwargs['object_cfgs'].items():
-        print("Setting eval time obj gains to 0.0")
-        cfg['actuated'] = False
+        if args.eval_object_gains is None:
+            print("Setting eval time obj gains to 0.0")
+            cfg['actuated'] = False
+        else:
+            kp, kv, force_range = args.eval_object_gains
+            print(
+                f"Building object {name!r} as actuated with fixed eval gains: "
+                f"kp={kp}, kv={kv}, force_range={force_range}"
+            )
+            cfg['actuated'] = True
+            cfg['kp'] = kp
+            cfg['kv'] = kv
+            cfg['force_range'] = force_range
+            env_kwargs['env_cfg']['scene_kwargs']['batch_dofs_info'] = True
 
     if args.overlay:
         env_kwargs['env_cfg']['env_spacing'] = (0.0, 0.0)
-    print("Removing any curriculum config during eval")
-    env_kwargs.pop("curriculum_cfg") 
+    if args.eval_object_gains is None:
+        print("Removing any curriculum config during eval")
+        env_kwargs.pop("curriculum_cfg")
+    else:
+        print("Keeping saved curriculum config for actuated-object construction only")
     device = torch.device('cuda:0')
     import genesis as gs
     gs.init(backend=gs.gpu, logging_level='warning')
     env = BaseEnv(
          **env_kwargs
     )
+    if args.eval_object_gains is not None:
+        print("Disabling object-gain curriculum before eval rollout")
+        env.use_curriculum = False
+        env.curriculum = None
+        env.curr_cfg = dict()
+        set_and_verify_eval_object_gains(env, args.eval_object_gains)
     if action_bench_runtime is not None:
         env = build_adapter_from_resolved_experiment(
             env,
@@ -252,9 +332,25 @@ def main():
     agent.restore(resume_path)
     agent.reset()
 
+    policy_env_idxs = None
+    if args.eval_object_gains is not None:
+        policy_env_idxs = torch.as_tensor(
+            uenv._step_env_idxs, dtype=torch.long, device=device
+        )
+        print(
+            f"Recording {policy_env_idxs.numel()} policy-controlled eval envs "
+            f"out of {uenv.num_envs} built envs"
+        )
+
     for eps in range(args.eval_episodes):
         frames, eval_data = eval_one_episode(
-            env, agent, obj_state_tensor, args.print_rew, args.record_video, args.show_reference
+            env,
+            agent,
+            obj_state_tensor,
+            args.print_rew,
+            args.record_video,
+            args.show_reference,
+            policy_env_idxs,
             )
         ckpt_eval_fname = os.path.join(ckpt_data_folder, f"eval_ep{eps}.npy")
         np.save(ckpt_eval_fname, eval_data)

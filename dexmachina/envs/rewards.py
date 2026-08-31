@@ -69,10 +69,13 @@ class RewardModule:
         self.obj_rot_beta = reward_cfg["obj_rot_beta"]
         self.obj_arti_beta = reward_cfg["obj_arti_beta"]
         if reward_cfg.get("objdex_baseline", False):
-            print("Using the lambdas from ObjDex baseline")
-            self.obj_pos_beta = 1.0
-            self.obj_rot_beta = 20.0
-            self.obj_arti_beta = 5.0
+            # objdex-balanced (2026-09-04, Harsh): task reward keeps the
+            # CONFIGURED betas (the method's 10/1/5 by default) instead of
+            # upstream's hardcoded (1, 20, 5), whose product form left
+            # position nearly free and rotation with no gradient outside a
+            # ~0.1 rad tube. Aux rewards stay zeroed — the protocol
+            # difference is aux/curriculum presence, not the task reward.
+            print("ObjDex baseline: task-reward-only with configured betas")
             self.imi_rew_weight = 0.0
             self.bc_rew_weight = 0.0
             self.task_rew_weight = 1.0
